@@ -1,0 +1,7 @@
+../Core/Src/controller.c:6:14:Controller_ClampFloat	3
+../Core/Src/controller.c:21:14:Controller_NewDeploymentInternal	3
+../Core/Src/controller.c:58:6:Controller_Init	2
+../Core/Src/controller.c:69:7:Controller_GetDeployment	2
+../Core/Src/controller.c:79:7:Controller_GetTargetApogee	2
+../Core/Src/controller.c:89:6:Controller_Close	4
+../Core/Src/controller.c:107:7:Controller_NewDeployment	7

@@ -1,0 +1,9 @@
+../Core/Inc/Fusion/FusionMath.h:136:21:FusionRadiansToDegrees	16	static
+../Core/Inc/Fusion/FusionMath.h:170:21:FusionFastInverseSqrt	24	static
+../Core/Inc/Fusion/FusionMath.h:235:28:FusionVectorScale	64	static
+../Core/Inc/Fusion/FusionMath.h:251:21:FusionVectorSum	24	static
+../Core/Inc/Fusion/FusionMath.h:261:28:FusionVectorHadamard	72	static
+../Core/Inc/Fusion/FusionMath.h:278:28:FusionVectorCross	72	static
+../Core/Inc/Fusion/FusionMath.h:304:21:FusionVectorNormSquared	40	static
+../Core/Inc/Fusion/FusionMath.h:322:28:FusionVectorNormalise	56	static
+../Core/Src/Fusion/FusionCompass.c:23:7:FusionCompass	208	static

@@ -1,0 +1,6 @@
+../Core/Src/sx1280_port.c:5:19:SX1280_PortInit	1
+../Core/Src/sx1280_port.c:12:6:SX1280_PortCsLow	1
+../Core/Src/sx1280_port.c:17:6:SX1280_PortCsHigh	1
+../Core/Src/sx1280_port.c:22:6:SX1280_PortReset	1
+../Core/Src/sx1280_port.c:36:19:SX1280_PortWaitBusyLow	3
+../Core/Src/sx1280_port.c:51:19:SX1280_PortSpiTxRx	1

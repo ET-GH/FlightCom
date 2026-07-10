@@ -1,0 +1,9 @@
+../USBX/App/ux_device_descriptors.c:100:10:USBD_Get_Device_Framework_Speed	24	static
+../USBX/App/ux_device_descriptors.c:119:10:USBD_Get_String_Framework	24	static
+../USBX/App/ux_device_descriptors.c:170:10:USBD_Get_Language_Id_Framework	24	static
+../USBX/App/ux_device_descriptors.c:191:10:USBD_Get_Interface_Number	24	static
+../USBX/App/ux_device_descriptors.c:213:10:USBD_Get_Configuration_Number	24	static
+../USBX/App/ux_device_descriptors.c:235:10:USBD_HID_ReportDesc	24	static
+../USBX/App/ux_device_descriptors.c:262:10:USBD_HID_ReportDesc_length	24	static
+../USBX/App/ux_device_descriptors.c:292:13:USBD_Desc_GetString	32	static
+../USBX/App/ux_device_descriptors.c:320:16:USBD_Desc_GetLen	24	static
