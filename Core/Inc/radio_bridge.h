@@ -2,6 +2,7 @@
 #define RADIO_BRIDGE_H
 
 #include "main.h"
+#include "behavior.h"
 #include <stdint.h>
 #include <string.h>
 

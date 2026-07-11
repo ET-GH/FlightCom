@@ -39,14 +39,14 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_hid.h \
  ../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h \
  ../USBX/Target/ux_stm32_config.h ../Core/Inc/radio_bridge.h \
- ../Core/Inc/main.h ../Core/Inc/tmc5240.h ../Core/Inc/airbrake.h \
- ../Core/Inc/controller.h ../Core/Inc/behavior.h \
- ../Core/Inc/altitude_ekf.h ../Core/Inc/rocket_sensors.h \
- ../Core/Inc/lsm6dsv32x.h ../Core/Inc/lis2mdl.h ../Core/Inc/bmp388.h \
- ../Core/Inc/Fusion/Fusion.h ../Core/Inc/Fusion/FusionAhrs.h \
- ../Core/Inc/Fusion/FusionConvention.h ../Core/Inc/Fusion/FusionMath.h \
- ../Core/Inc/Fusion/FusionBias.h ../Core/Inc/Fusion/FusionCompass.h \
- ../Core/Inc/Fusion/FusionModel.h ../Core/Inc/Fusion/FusionRemap.h \
+ ../Core/Inc/main.h ../Core/Inc/behavior.h ../Core/Inc/altitude_ekf.h \
+ ../Core/Inc/rocket_sensors.h ../Core/Inc/lsm6dsv32x.h \
+ ../Core/Inc/lis2mdl.h ../Core/Inc/bmp388.h ../Core/Inc/Fusion/Fusion.h \
+ ../Core/Inc/Fusion/FusionAhrs.h ../Core/Inc/Fusion/FusionConvention.h \
+ ../Core/Inc/Fusion/FusionMath.h ../Core/Inc/Fusion/FusionBias.h \
+ ../Core/Inc/Fusion/FusionCompass.h ../Core/Inc/Fusion/FusionModel.h \
+ ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/tmc5240.h \
+ ../Core/Inc/airbrake.h ../Core/Inc/controller.h ../Core/Inc/behavior.h \
  ../Core/Inc/openrocket_run_data.h
 ../Core/Inc/main.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
@@ -93,9 +93,6 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../USBX/Target/ux_stm32_config.h:
 ../Core/Inc/radio_bridge.h:
 ../Core/Inc/main.h:
-../Core/Inc/tmc5240.h:
-../Core/Inc/airbrake.h:
-../Core/Inc/controller.h:
 ../Core/Inc/behavior.h:
 ../Core/Inc/altitude_ekf.h:
 ../Core/Inc/rocket_sensors.h:
@@ -110,4 +107,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/Fusion/FusionCompass.h:
 ../Core/Inc/Fusion/FusionModel.h:
 ../Core/Inc/Fusion/FusionRemap.h:
+../Core/Inc/tmc5240.h:
+../Core/Inc/airbrake.h:
+../Core/Inc/controller.h:
+../Core/Inc/behavior.h:
 ../Core/Inc/openrocket_run_data.h:

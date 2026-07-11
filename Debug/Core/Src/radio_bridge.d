@@ -32,7 +32,14 @@ Core/Src/radio_bridge.o: ../Core/Src/radio_bridge.c \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_usb.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd_ex.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h \
- ../Core/Inc/sx1280.h
+ ../Core/Inc/behavior.h ../Core/Inc/altitude_ekf.h \
+ ../Core/Inc/rocket_sensors.h ../Core/Inc/lsm6dsv32x.h \
+ ../Core/Inc/lis2mdl.h ../Core/Inc/bmp388.h ../Core/Inc/Fusion/Fusion.h \
+ ../Core/Inc/Fusion/FusionAhrs.h ../Core/Inc/Fusion/FusionConvention.h \
+ ../Core/Inc/Fusion/FusionMath.h ../Core/Inc/Fusion/FusionBias.h \
+ ../Core/Inc/Fusion/FusionCompass.h ../Core/Inc/Fusion/FusionModel.h \
+ ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/rocket_protocol.h \
+ ../Core/Inc/sx1280.h ../Core/Inc/airbrake.h
 ../Core/Inc/radio_bridge.h:
 ../Core/Inc/main.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
@@ -67,4 +74,20 @@ Core/Src/radio_bridge.o: ../Core/Src/radio_bridge.c \
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_usb.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd_ex.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h:
+../Core/Inc/behavior.h:
+../Core/Inc/altitude_ekf.h:
+../Core/Inc/rocket_sensors.h:
+../Core/Inc/lsm6dsv32x.h:
+../Core/Inc/lis2mdl.h:
+../Core/Inc/bmp388.h:
+../Core/Inc/Fusion/Fusion.h:
+../Core/Inc/Fusion/FusionAhrs.h:
+../Core/Inc/Fusion/FusionConvention.h:
+../Core/Inc/Fusion/FusionMath.h:
+../Core/Inc/Fusion/FusionBias.h:
+../Core/Inc/Fusion/FusionCompass.h:
+../Core/Inc/Fusion/FusionModel.h:
+../Core/Inc/Fusion/FusionRemap.h:
+../Core/Inc/rocket_protocol.h:
 ../Core/Inc/sx1280.h:
+../Core/Inc/airbrake.h:
