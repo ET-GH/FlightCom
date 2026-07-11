@@ -1,7 +1,0 @@
-../Core/Src/controller.c:6:14:Controller_ClampFloat	24	static
-../Core/Src/controller.c:21:14:Controller_NewDeploymentInternal	72	static
-../Core/Src/controller.c:58:6:Controller_Init	16	static
-../Core/Src/controller.c:69:7:Controller_GetDeployment	16	static
-../Core/Src/controller.c:79:7:Controller_GetTargetApogee	16	static
-../Core/Src/controller.c:89:6:Controller_Close	24	static
-../Core/Src/controller.c:107:7:Controller_NewDeployment	32	static

@@ -1,7 +1,0 @@
-../Core/Src/lis2mdl.c:7:26:lis2mdl_write_u8	3
-../Core/Src/lis2mdl.c:23:26:lis2mdl_read_u8	4
-../Core/Src/lis2mdl.c:39:26:lis2mdl_read_bytes_auto_inc	5
-../Core/Src/lis2mdl.c:56:19:LIS2MDL_ReadWhoAmI	1
-../Core/Src/lis2mdl.c:61:19:LIS2MDL_ReadStatus	1
-../Core/Src/lis2mdl.c:66:19:LIS2MDL_Init	9
-../Core/Src/lis2mdl.c:108:19:LIS2MDL_ReadData	3

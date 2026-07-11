@@ -1,9 +1,0 @@
-../Core/Src/flight_log.c:20:27:FlightLog_FromFlashResult	16	static
-../Core/Src/flight_log.c:35:13:FlightLog_SanitizeMessage	32	static
-../Core/Src/flight_log.c:73:27:FlightLog_AppendBytes	32	static
-../Core/Src/flight_log.c:111:20:FlightLog_Begin	32	static
-../Core/Src/flight_log.c:152:20:FlightLog_BeginDefault	32	static
-../Core/Src/flight_log.c:163:20:FlightLog_AppendPayload	472	static
-../Core/Src/flight_log.c:225:20:FlightLog_AppendRawLine	24	static
-../Core/Src/flight_log.c:239:10:FlightLog_GetWriteAddress	16	static
-../Core/Src/flight_log.c:249:10:FlightLog_GetBytesUsed	16	static

@@ -1,3 +1,0 @@
-../USBX/App/app_usbx_device.c:61:6:MX_USBX_Device_Init	2
-../USBX/App/app_usbx_device.c:92:6:MX_USBX_Device_Stack_Init	1
-../USBX/App/app_usbx_device.c:119:6:MX_USBX_Device_Stack_DeInit	3

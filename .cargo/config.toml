@@ -1,0 +1,21 @@
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+  # Usual Arm bare-metal linker setup.
+  "-Clink-arg=-Tlink.x",
+  "-Clink-arg=--nmagic",
+  # Needed for defmt.
+  "-Clink-arg=-Tdefmt.x",
+  # Tell rust our chip has a Cortex-M33 core.
+  "-Ctarget-cpu=cortex-m33",
+]
+
+runner = "probe-rs run --chip STM32H562RG"
+
+[alias]
+f = "flash --chip STM32H562RG"
+
+[env]
+DEFMT_LOG = "info"

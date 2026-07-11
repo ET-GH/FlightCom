@@ -1,2 +1,0 @@
-../Middlewares/ST/usbx/common/usbx_device_classes/src/ux_device_class_hid_read_run.c:82:6:_ux_device_class_hid_read_run	24	static
-../Middlewares/ST/usbx/common/usbx_device_classes/src/ux_device_class_hid_read_run.c:340:6:_uxe_device_class_hid_read_run	24	static
