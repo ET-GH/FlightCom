@@ -1,379 +1,244 @@
 #include "radio_bridge.h"
+#include "rocket_protocol.h"
 #include "sx1280.h"
-#include <stdint.h>
+#include "airbrake.h"
+#include <math.h>
 #include <string.h>
-#include <stdio.h>
 
-#define RADIO_TX_TIMEOUT_MS              2000UL
-#define RADIO_BRIDGE_HEARTBEAT_ENABLE     1
-#define RADIO_BRIDGE_HEARTBEAT_PERIOD_MS  5000UL
+#define RADIO_TX_TIMEOUT_MS       2000u
+#define TELEMETRY_PERIOD_MS       100u   /* 10 Hz normal stream */
+#define HEARTBEAT_PERIOD_MS       1000u
+#define EVENT_REPEAT_COUNT        3u
 
-#define PAYLOAD_MAGIC       0xA5
-#define PAYLOAD_VERSION     0x01
-#define PAYLOAD_TYPE_DATA   0x01
+static volatile uint8_t dio1_seen;
+static uint16_t tx_sequence;
+static uint32_t last_telemetry_ms;
+static uint32_t last_heartbeat_ms;
+static uint16_t previous_flags;
+static uint8_t previous_state;
+static uint8_t previous_status = 0xFFu;
+static uint8_t previous_deployment;
+static uint8_t snapshot_requested;
 
-#define TAG_IMU             0x10
-#define TAG_BARO            0x20
-#define TAG_MAGNET          0x30
-#define TAG_CALC            0x40
-#define TAG_STATUS_MSG      0x50
-#define TAG_COMMAND_MSG     0x51
-#define TAG_ERROR_MSG       0x52
+static int16_t clamp_i16(float v) {
+    if (!isfinite(v)) return 0;
+    if (v > 32767.0f) return 32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)lroundf(v);
+}
+static uint16_t clamp_u16(float v) {
+    if (!isfinite(v) || v <= 0.0f) return 0;
+    if (v > 65535.0f) return 65535u;
+    return (uint16_t)lroundf(v);
+}
+static uint16_t sat_u16_u32(uint32_t v) { return v > 65535u ? 65535u : (uint16_t)v; }
 
-#define IMU_COUNT           6
-#define BARO_COUNT          2
-#define MAGNET_COUNT        3
-#define CALC_COUNT          4
-#define MAX_MESSAGE_LEN     48
-
-static volatile uint8_t radio_dio1_seen = 0;
-static uint32_t last_heartbeat_ms = 0;
-static uint32_t heartbeat_counter = 0;
-static uint16_t payload_sequence = 0;
-
-static size_t RadioBridge_BoundedStringLength(const char *text, size_t maximum)
-{
-    size_t length = 0;
-
-    if (text == 0)
-    {
-        return 0;
-    }
-
-    while ((length < maximum) && (text[length] != '\0'))
-    {
-        length++;
-    }
-
-    return length;
+static uint16_t make_flags(const volatile BehaviorTelemetry_t *t) {
+    uint16_t f = 0;
+    if (t->initialized)                    f |= ROCKET_FLAG_INITIALIZED;
+    if (t->barometer_altitude_valid)       f |= ROCKET_FLAG_BARO_VALID;
+    if (t->fusion_data_valid)              f |= ROCKET_FLAG_FUSION_VALID;
+    if (t->ekf_data_valid)                 f |= ROCKET_FLAG_EKF_VALID;
+    if (t->controller_enabled)             f |= ROCKET_FLAG_CONTROLLER_ENABLED;
+    if (t->controller_active)              f |= ROCKET_FLAG_CONTROLLER_ACTIVE;
+    if (t->apogee_reached)                 f |= ROCKET_FLAG_APOGEE_REACHED;
+    if (t->mode_changed)                   f |= ROCKET_FLAG_MODE_CHANGED;
+    if (t->barometer_correction_used)      f |= ROCKET_FLAG_BARO_CORRECTION_USED;
+    if (t->fusion_startup)                 f |= ROCKET_FLAG_FUSION_STARTUP;
+    if (t->fusion_accelerometer_ignored)   f |= ROCKET_FLAG_ACCEL_IGNORED;
+    if (t->fusion_magnetometer_ignored)    f |= ROCKET_FLAG_MAG_IGNORED;
+    if (t->full_pipeline_complete)         f |= ROCKET_FLAG_PIPELINE_COMPLETE;
+    if (t->full_pipeline_pass)             f |= ROCKET_FLAG_PIPELINE_PASS;
+    if ((t->imu_status != HAL_OK) || (t->mag_status != HAL_OK) || (t->baro_status != HAL_OK))
+        f |= ROCKET_FLAG_SENSOR_FAULT;
+    return f;
 }
 
-typedef struct
-{
-    uint8_t *data;
-    uint16_t length;
-    uint16_t capacity;
-} PayloadBuilder;
-
-static HAL_StatusTypeDef PayloadBuilder_Reserve(const PayloadBuilder *builder,
-                                                 uint16_t bytes)
-{
-    if ((builder == 0) || (builder->data == 0))
-    {
-        return HAL_ERROR;
-    }
-
-    if ((builder->length + bytes) > builder->capacity)
-    {
-        return HAL_ERROR;
-    }
-
-    return HAL_OK;
+static uint8_t make_state(const volatile BehaviorTelemetry_t *t) {
+    return (uint8_t)((((uint8_t)t->mode & 0x0Fu) << 4) | ((uint8_t)t->flight_phase & 0x0Fu));
 }
 
-static HAL_StatusTypeDef PayloadBuilder_AddU8(PayloadBuilder *builder,
-                                               uint8_t value)
-{
-    if (PayloadBuilder_Reserve(builder, 1) != HAL_OK)
-    {
-        return HAL_ERROR;
-    }
-
-    builder->data[builder->length++] = value;
-    return HAL_OK;
+static uint8_t health2(HAL_StatusTypeDef s) {
+    return (s == HAL_OK) ? ROCKET_SENSOR_OK : ROCKET_SENSOR_FAULT;
+}
+static uint8_t make_sensor_health(const volatile BehaviorTelemetry_t *t) {
+    return (uint8_t)(health2(t->imu_status) |
+                    (health2(t->mag_status) << 2) |
+                    (health2(t->baro_status) << 4));
 }
 
-static HAL_StatusTypeDef PayloadBuilder_AddU16(PayloadBuilder *builder,
-                                                uint16_t value)
-{
-    if (PayloadBuilder_Reserve(builder, 2) != HAL_OK)
-    {
-        return HAL_ERROR;
-    }
-
-    builder->data[builder->length++] = (uint8_t)(value & 0xFFU);
-    builder->data[builder->length++] = (uint8_t)((value >> 8) & 0xFFU);
-    return HAL_OK;
-}
-
-static HAL_StatusTypeDef PayloadBuilder_AddU32(PayloadBuilder *builder,
-                                                uint32_t value)
-{
-    if (PayloadBuilder_Reserve(builder, 4) != HAL_OK)
-    {
-        return HAL_ERROR;
-    }
-
-    builder->data[builder->length++] = (uint8_t)(value & 0xFFUL);
-    builder->data[builder->length++] = (uint8_t)((value >> 8) & 0xFFUL);
-    builder->data[builder->length++] = (uint8_t)((value >> 16) & 0xFFUL);
-    builder->data[builder->length++] = (uint8_t)((value >> 24) & 0xFFUL);
-    return HAL_OK;
-}
-
-static HAL_StatusTypeDef PayloadBuilder_AddU16Array(PayloadBuilder *builder,
-                                                     uint8_t tag,
-                                                     const uint16_t *values,
-                                                     uint8_t count)
-{
-    uint8_t i;
-
-    if ((values == 0) || (count == 0))
-    {
-        return HAL_ERROR;
-    }
-
-    if (PayloadBuilder_Reserve(builder, (uint16_t)(2U + (2U * count))) != HAL_OK)
-    {
-        return HAL_ERROR;
-    }
-
-    if ((PayloadBuilder_AddU8(builder, tag) != HAL_OK) ||
-        (PayloadBuilder_AddU8(builder, count) != HAL_OK))
-    {
-        return HAL_ERROR;
-    }
-
-    for (i = 0; i < count; i++)
-    {
-        if (PayloadBuilder_AddU16(builder, values[i]) != HAL_OK)
-        {
-            return HAL_ERROR;
-        }
-    }
-
-    return HAL_OK;
-}
-
-static HAL_StatusTypeDef PayloadBuilder_AddU32Array(PayloadBuilder *builder,
-                                                     uint8_t tag,
-                                                     const uint32_t *values,
-                                                     uint8_t count)
-{
-    uint8_t i;
-
-    if ((values == 0) || (count == 0))
-    {
-        return HAL_ERROR;
-    }
-
-    if (PayloadBuilder_Reserve(builder, (uint16_t)(2U + (4U * count))) != HAL_OK)
-    {
-        return HAL_ERROR;
-    }
-
-    if ((PayloadBuilder_AddU8(builder, tag) != HAL_OK) ||
-        (PayloadBuilder_AddU8(builder, count) != HAL_OK))
-    {
-        return HAL_ERROR;
-    }
-
-    for (i = 0; i < count; i++)
-    {
-        if (PayloadBuilder_AddU32(builder, values[i]) != HAL_OK)
-        {
-            return HAL_ERROR;
-        }
-    }
-
-    return HAL_OK;
-}
-
-static HAL_StatusTypeDef PayloadBuilder_AddString(PayloadBuilder *builder,
-                                                   uint8_t tag,
-                                                   const char *message)
-{
-    size_t len;
-
-    if (message == 0)
-    {
-        return HAL_OK;
-    }
-
-    len = RadioBridge_BoundedStringLength(message, MAX_MESSAGE_LEN);
-    if (len == 0)
-    {
-        return HAL_OK;
-    }
-
-    if (PayloadBuilder_Reserve(builder, (uint16_t)(2U + len)) != HAL_OK)
-    {
-        return HAL_ERROR;
-    }
-
-    if ((PayloadBuilder_AddU8(builder, tag) != HAL_OK) ||
-        (PayloadBuilder_AddU8(builder, (uint8_t)len) != HAL_OK))
-    {
-        return HAL_ERROR;
-    }
-
-    memcpy(&builder->data[builder->length], message, len);
-    builder->length += (uint16_t)len;
-    return HAL_OK;
-}
-
-HAL_StatusTypeDef PayloadPipeline(uint16_t *IMU,
-                                  uint32_t *Baro,
-                                  uint16_t *Magnet,
-                                  uint16_t *Calc,
-                                  const char *Message[3],
-                                  uint8_t deployment_state)
-{
-    uint8_t tx_buffer[SX1280_MAX_PAYLOAD_LEN];
-    uint32_t current_time_ms = HAL_GetTick();
-    PayloadBuilder builder = {
-        .data = tx_buffer,
-        .length = 0,
-        .capacity = SX1280_MAX_PAYLOAD_LEN
-    };
-
-    if ((IMU == 0) || (Baro == 0) || (Magnet == 0) || (Calc == 0))
-    {
-        return HAL_ERROR;
-    }
-
-    /* Application header.  The SX1280 adds the physical LoRa packet fields. */
-    if ((PayloadBuilder_AddU8(&builder, PAYLOAD_MAGIC) != HAL_OK) ||
-        (PayloadBuilder_AddU8(&builder, PAYLOAD_VERSION) != HAL_OK) ||
-        (PayloadBuilder_AddU8(&builder, PAYLOAD_TYPE_DATA) != HAL_OK) ||
-        (PayloadBuilder_AddU16(&builder, payload_sequence++) != HAL_OK) ||
-        (PayloadBuilder_AddU32(&builder, current_time_ms) != HAL_OK) ||
-        (PayloadBuilder_AddU8(&builder, deployment_state) != HAL_OK))
-    {
-        return HAL_ERROR;
-    }
-
-    if ((PayloadBuilder_AddU16Array(&builder, TAG_IMU, IMU, IMU_COUNT) != HAL_OK) ||
-        (PayloadBuilder_AddU32Array(&builder, TAG_BARO, Baro, BARO_COUNT) != HAL_OK) ||
-        (PayloadBuilder_AddU16Array(&builder, TAG_MAGNET, Magnet, MAGNET_COUNT) != HAL_OK) ||
-        (PayloadBuilder_AddU16Array(&builder, TAG_CALC, Calc, CALC_COUNT) != HAL_OK))
-    {
-        return HAL_ERROR;
-    }
-
-    if (Message != 0)
-    {
-        if ((PayloadBuilder_AddString(&builder, TAG_STATUS_MSG, Message[0]) != HAL_OK) ||
-            (PayloadBuilder_AddString(&builder, TAG_COMMAND_MSG, Message[1]) != HAL_OK) ||
-            (PayloadBuilder_AddString(&builder, TAG_ERROR_MSG, Message[2]) != HAL_OK))
-        {
-            return HAL_ERROR;
-        }
-    }
-
-    if ((builder.length == 0) || (builder.length > SX1280_MAX_PAYLOAD_LEN))
-    {
-        return HAL_ERROR;
-    }
-
-    return SX1280_Transmit(tx_buffer,
-                           (uint8_t)builder.length,
-                           RADIO_TX_TIMEOUT_MS);
-}
-
-/*
- * If HAL_GPIO_EXTI_Callback() is already defined elsewhere, merge this case
- * into that callback instead of keeping two definitions.
- */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == LORA_DIO1_Pin)
-    {
-        radio_dio1_seen = 1;
+static uint8_t map_status(uint32_t s) {
+    /* BehaviorStatus_t currently uses compact enum values; explicit mapping keeps RF stable. */
+    switch (s) {
+        case 0: return ROCKET_STATUS_OK;
+        case 1: return ROCKET_STATUS_BAD_ARGUMENT;
+        case 2: return ROCKET_STATUS_INVALID_CONFIG;
+        case 3: return ROCKET_STATUS_UNSUPPORTED_MODE;
+        case 4: return ROCKET_STATUS_SENSOR_INIT_FAILED;
+        default: return ROCKET_STATUS_UNKNOWN;
     }
 }
 
-HAL_StatusTypeDef RadioBridge_Init(void)
-{
-    HAL_StatusTypeDef status;
-    const char boot_msg[] = "STM32_BOOT";
-
-    status = SX1280_InitLoRa();
-    if (status != HAL_OK)
-    {
-        return status;
+static uint8_t event_message(const volatile BehaviorTelemetry_t *t, uint16_t changed,
+                             uint8_t old_state, uint8_t new_state, uint8_t old_dep) {
+    uint8_t old_phase = old_state & 0x0Fu;
+    uint8_t new_phase = new_state & 0x0Fu;
+    if ((changed & ROCKET_FLAG_APOGEE_REACHED) && t->apogee_reached) return ROCKET_MSG_APOGEE_REACHED;
+    if (new_phase != old_phase) {
+        if (new_phase == 1u) return ROCKET_MSG_LAUNCH_DETECTED;
+        if (new_phase == 2u) return ROCKET_MSG_BURNOUT_DETECTED;
+        if (new_phase == 4u) return ROCKET_MSG_LANDING_DETECTED;
     }
-
-    status = SX1280_Transmit((const uint8_t *)boot_msg,
-                             (uint8_t)strlen(boot_msg),
-                             RADIO_TX_TIMEOUT_MS);
-    if (status != HAL_OK)
-    {
-        return status;
-    }
-
-    last_heartbeat_ms = HAL_GetTick();
-    return HAL_OK;
+    if (t->mode_changed || ((new_state >> 4) != (old_state >> 4))) return ROCKET_MSG_MODE_CHANGED;
+    if (old_dep == 0u && t->controller_requested_percent > 0u) return ROCKET_MSG_AIRBRAKE_DEPLOYED;
+    if (old_dep > 0u && t->controller_requested_percent == 0u) return ROCKET_MSG_AIRBRAKE_RETRACTED;
+    if (changed & ROCKET_FLAG_CONTROLLER_ENABLED)
+        return t->controller_enabled ? ROCKET_MSG_CONTROLLER_ENABLED : ROCKET_MSG_CONTROLLER_DISABLED;
+    return ROCKET_MSG_NONE;
 }
 
-HAL_StatusTypeDef RadioBridge_SendText(const char *text)
-{
-    size_t len;
-
-    if (text == 0)
-    {
-        return HAL_ERROR;
-    }
-
-    len = RadioBridge_BoundedStringLength(text, SX1280_MAX_PAYLOAD_LEN + 1U);
-    if ((len == 0) || (len > SX1280_MAX_PAYLOAD_LEN))
-    {
-        return HAL_ERROR;
-    }
-
-    return SX1280_Transmit((const uint8_t *)text,
-                           (uint8_t)len,
-                           RADIO_TX_TIMEOUT_MS);
+static HAL_StatusTypeDef transmit(const uint8_t *packet, uint8_t length) {
+    return SX1280_Transmit(packet, length, RADIO_TX_TIMEOUT_MS);
 }
 
-void RadioBridge_Task(void)
-{
-    uint8_t payload[SX1280_MAX_PAYLOAD_LEN + 1U];
-    uint8_t payload_len = 0;
+static HAL_StatusTypeDef send_telemetry(const volatile BehaviorTelemetry_t *t, uint32_t now_ms,
+                                        uint8_t message) {
+    uint8_t p[ROCKET_PROTOCOL_HEADER_SIZE + 29u];
+    size_t i = RocketProtocol_EncodeHeader(p, sizeof(p), ROCKET_PKT_TELEMETRY, tx_sequence++, now_ms);
+    uint16_t flags = make_flags(t);
+    RocketProtocol_WriteU16(p + i, flags); i += 2;
+    p[i++] = make_state(t);
+    p[i++] = map_status((uint32_t)t->status);
+    RocketProtocol_WriteI16(p + i, clamp_i16(t->ekf_altitude_m * 10.0f)); i += 2;
+    RocketProtocol_WriteI16(p + i, clamp_i16(t->ekf_velocity_m_s * 100.0f)); i += 2;
+    RocketProtocol_WriteI16(p + i, clamp_i16(t->ekf_acceleration_m_s2 * 100.0f)); i += 2;
+    RocketProtocol_WriteU16(p + i, clamp_u16(t->predicted_apogee_m * 10.0f)); i += 2;
+    RocketProtocol_WriteU16(p + i, clamp_u16(t->target_apogee_m * 10.0f)); i += 2;
+    RocketProtocol_WriteI16(p + i, clamp_i16(t->fusion_roll_deg * 10.0f)); i += 2;
+    RocketProtocol_WriteI16(p + i, clamp_i16(t->fusion_pitch_deg * 10.0f)); i += 2;
+    RocketProtocol_WriteI16(p + i, clamp_i16(t->fusion_yaw_deg * 10.0f)); i += 2;
+    p[i++] = t->controller_requested_percent;
+    p[i++] = make_sensor_health(t);
+    RocketProtocol_WriteU16(p + i, sat_u16_u32(t->failed_reads)); i += 2;
+    p[i++] = message;
+    p[i++] = 0;
+    return transmit(p, (uint8_t)i);
+}
 
-    if ((radio_dio1_seen != 0) ||
-        (HAL_GPIO_ReadPin(LORA_DIO1_GPIO_Port, LORA_DIO1_Pin) == GPIO_PIN_SET))
-    {
-        radio_dio1_seen = 0;
+static HAL_StatusTypeDef send_event(const volatile BehaviorTelemetry_t *t, uint32_t now_ms,
+                                    uint16_t changed, uint8_t old_state, uint8_t message) {
+    uint8_t p[ROCKET_PROTOCOL_HEADER_SIZE + 10u];
+    size_t i = RocketProtocol_EncodeHeader(p, sizeof(p), ROCKET_PKT_EVENT, tx_sequence++, now_ms);
+    RocketProtocol_WriteU16(p + i, changed); i += 2;
+    RocketProtocol_WriteU16(p + i, make_flags(t)); i += 2;
+    p[i++] = old_state;
+    p[i++] = make_state(t);
+    p[i++] = map_status((uint32_t)t->status);
+    p[i++] = message;
+    RocketProtocol_WriteU16(p + i, t->controller_requested_percent); i += 2;
+    return transmit(p, (uint8_t)i);
+}
 
-        if (SX1280_ReadPacketIfAvailable(payload, &payload_len) == HAL_OK)
-        {
-            payload[payload_len] = '\0';
+static void send_ack(uint16_t command_seq, uint8_t command, uint8_t result, uint16_t detail, uint32_t now_ms) {
+    uint8_t p[ROCKET_PROTOCOL_HEADER_SIZE + 6u];
+    size_t i = RocketProtocol_EncodeHeader(p, sizeof(p), ROCKET_PKT_ACK, tx_sequence++, now_ms);
+    RocketProtocol_WriteU16(p + i, command_seq); i += 2;
+    p[i++] = command;
+    p[i++] = result;
+    RocketProtocol_WriteU16(p + i, detail); i += 2;
+    (void)transmit(p, (uint8_t)i);
+}
 
-            /* Temporary text acknowledgement used during radio bring-up. */
-            char reply[SX1280_MAX_PAYLOAD_LEN + 20U];
-            int n = snprintf(reply, sizeof(reply), "STM32_RX:%s", (char *)payload);
-
-            if (n > 0)
-            {
-                if (n > (int)SX1280_MAX_PAYLOAD_LEN)
-                {
-                    n = SX1280_MAX_PAYLOAD_LEN;
-                }
-
-                (void)SX1280_Transmit((const uint8_t *)reply,
-                                      (uint8_t)n,
-                                      RADIO_TX_TIMEOUT_MS);
+static void process_command(const uint8_t *p, uint8_t len, uint32_t now_ms) {
+    RocketPacketHeader h;
+    uint8_t cmd, n, result = ROCKET_ACK_OK;
+    uint16_t detail = 0;
+    if (!RocketProtocol_DecodeHeader(p, len, &h) || h.type != ROCKET_PKT_COMMAND || len < 11u) return;
+    cmd = p[9]; n = p[10];
+    if ((uint16_t)11u + n > len) { send_ack(h.sequence, cmd, ROCKET_ACK_BAD_LENGTH, len, now_ms); return; }
+    switch (cmd) {
+        case ROCKET_CMD_PING: break;
+        case ROCKET_CMD_REQUEST_SNAPSHOT: snapshot_requested = 1u; break;
+        case ROCKET_CMD_SET_TARGET_APOGEE:
+            if (n != 2u) result = ROCKET_ACK_BAD_LENGTH;
+            else {
+                uint16_t dm = RocketProtocol_ReadU16(p + 11);
+                if (Behavior_SetTargetApogee((float)dm / 10.0f, now_ms) != BEHAVIOR_STATUS_OK)
+                    result = ROCKET_ACK_BAD_VALUE;
+                detail = dm;
             }
-        }
+            break;
+        case ROCKET_CMD_SET_CONTROLLER:
+            if (n != 1u || p[11] > 1u) result = ROCKET_ACK_BAD_VALUE;
+            else { Behavior_SetControllerEnabled(p[11] != 0u); detail = p[11]; }
+            break;
+        case ROCKET_CMD_SET_MODE:
+            if (n != 3u) result = ROCKET_ACK_BAD_LENGTH;
+            else {
+                uint8_t mode = p[11];
+                uint16_t duration_s = RocketProtocol_ReadU16(p + 12);
+                if (Behavior_RequestMode((BehaviorMode_t)mode, (uint32_t)duration_s * 1000u, now_ms) != BEHAVIOR_STATUS_OK)
+                    result = ROCKET_ACK_BAD_VALUE;
+                detail = mode;
+            }
+            break;
+        case ROCKET_CMD_RETURN_STANDARD: Behavior_ReturnToStandard(now_ms); break;
+        case ROCKET_CMD_MANUAL_AIRBRAKE:
+            if (n != 1u || p[11] > 100u) result = ROCKET_ACK_BAD_VALUE;
+            else { Airbrake_SetManualOverride(true); Airbrake_SetTargetPercent(p[11]); detail = p[11]; }
+            break;
+        default: result = ROCKET_ACK_UNSUPPORTED; break;
+    }
+    send_ack(h.sequence, cmd, result, detail, now_ms);
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == LORA_DIO1_Pin) dio1_seen = 1u;
+}
+
+HAL_StatusTypeDef RadioBridge_Init(void) {
+    HAL_StatusTypeDef s = SX1280_InitLoRa();
+    tx_sequence = 0; last_telemetry_ms = 0; last_heartbeat_ms = 0;
+    previous_flags = 0; previous_state = 0xFFu; previous_status = 0xFFu;
+    previous_deployment = 0; snapshot_requested = 1;
+    return s;
+}
+
+void RadioBridge_RequestSnapshot(void) { snapshot_requested = 1u; }
+
+void RadioBridge_Task(const volatile BehaviorTelemetry_t *t, uint32_t now_ms) {
+    uint8_t rx[ROCKET_PROTOCOL_MAX_PACKET];
+    uint8_t rx_len = 0;
+    uint16_t flags, changed;
+    uint8_t state, status, message;
+    if (!t) return;
+
+    if (dio1_seen || HAL_GPIO_ReadPin(LORA_DIO1_GPIO_Port, LORA_DIO1_Pin) == GPIO_PIN_SET) {
+        dio1_seen = 0;
+        if (SX1280_ReadPacketIfAvailable(rx, &rx_len) == HAL_OK) process_command(rx, rx_len, now_ms);
     }
 
-#if RADIO_BRIDGE_HEARTBEAT_ENABLE
-    if ((HAL_GetTick() - last_heartbeat_ms) >= RADIO_BRIDGE_HEARTBEAT_PERIOD_MS)
-    {
-        char msg[48];
-        int n;
+    flags = make_flags(t); state = make_state(t); status = map_status((uint32_t)t->status);
+    changed = (uint16_t)(flags ^ previous_flags);
+    message = event_message(t, changed, previous_state, state, previous_deployment);
 
-        last_heartbeat_ms = HAL_GetTick();
-        n = snprintf(msg, sizeof(msg), "STM32_HEARTBEAT_%lu",
-                     (unsigned long)heartbeat_counter++);
-
-        if (n > 0)
-        {
-            (void)SX1280_Transmit((const uint8_t *)msg,
-                                  (uint8_t)n,
-                                  RADIO_TX_TIMEOUT_MS);
-        }
+    if (changed || state != previous_state || status != previous_status ||
+        t->controller_requested_percent != previous_deployment) {
+        uint8_t r;
+        for (r = 0; r < EVENT_REPEAT_COUNT; ++r)
+            (void)send_event(t, now_ms, changed, previous_state, message);
+        previous_flags = flags; previous_state = state; previous_status = status;
+        previous_deployment = t->controller_requested_percent;
     }
-#endif
+
+    if (snapshot_requested || (uint32_t)(now_ms - last_telemetry_ms) >= TELEMETRY_PERIOD_MS) {
+        snapshot_requested = 0;
+        last_telemetry_ms = now_ms;
+        (void)send_telemetry(t, now_ms, ROCKET_MSG_NONE);
+    }
+
+    if ((uint32_t)(now_ms - last_heartbeat_ms) >= HEARTBEAT_PERIOD_MS) {
+        last_heartbeat_ms = now_ms;
+        /* Telemetry doubles as heartbeat; no redundant text packet. */
+    }
 }

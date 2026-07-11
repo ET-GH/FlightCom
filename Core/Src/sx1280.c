@@ -1,3 +1,10 @@
+/*
+ * Fixed RF profile:
+ *   2445 MHz, LoRa SF8, 203.125 kHz BW, CR 4/5,
+ *   explicit header, payload CRC, standard IQ, 12-symbol preamble,
+ *   +13 dBm requested TX power, and high-sensitivity RX.
+ */
+
 #include "sx1280.h"
 #include "sx1280_port.h"
 #include <stdint.h>
@@ -65,6 +72,15 @@
 #define SX1280_STDBY_RC                  0x00
 #define SX1280_RAMP_20_US                0xE0
 
+/*
+ * Fixed flight-link timeout settings for the 5,000 ft profile.
+ * SetTx uses a 4 ms base and 500 counts, giving a 2.0 s radio-side timeout.
+ * The MCU waits slightly longer so the radio IRQ is always handled first.
+ */
+#define SX1280_TX_TIMEOUT_BASE_4_MS       0x03
+#define SX1280_TX_TIMEOUT_COUNT           500U
+#define SX1280_MIN_SOFTWARE_TIMEOUT_MS    2500U
+
 /* Registers used by the LoRa modem. */
 #define SX1280_REG_RX_GAIN               0x0891
 #define SX1280_REG_SF_ADDITIONAL_CONFIG  0x0925
@@ -80,7 +96,7 @@ typedef struct
     uint8_t spreading_factor;
     uint8_t bandwidth;
     uint8_t coding_rate;
-    uint8_t preamble_symbols;
+    uint8_t preamble_param;
     uint8_t header_type;
     uint8_t crc_mode;
     uint8_t iq_mode;
@@ -89,16 +105,13 @@ typedef struct
 } SX1280_LoRaConfig;
 
 /*
- * Balanced starting profile for a 5,000 ft line-of-sight telemetry link:
+ * Dedicated onboard profile for a 5,000 ft line-of-sight rocket telemetry link:
  *   - SF8 gives 3 dB more sensitivity than the previous SF7 setting.
  *   - 203 kHz is the narrowest SX1280 LoRa bandwidth and maximizes sensitivity.
  *   - CR 4/5 keeps airtime reasonable for live telemetry.
  *   - +13 dBm is the maximum SetTxParams command value for the bare SX1280.
  *   - High-sensitivity RX enables the upper LNA gain steps.
  *
- * Both radios must use the same frequency, SF, BW, CR, header, CRC and IQ mode.
- * If the module has an external power amplifier, verify its permitted drive
- * level before using +13 dBm from the SX1280.
  */
 static const SX1280_LoRaConfig sx1280_default_config =
 {
@@ -106,7 +119,7 @@ static const SX1280_LoRaConfig sx1280_default_config =
     .spreading_factor   = SX1280_LORA_SF8,
     .bandwidth          = SX1280_LORA_BW_203_KHZ,
     .coding_rate        = SX1280_LORA_CR_4_5,
-    .preamble_symbols   = 12,
+    .preamble_param     = 0x0C, /* 12 symbols: mantissa 12, exponent 0 */
     .header_type        = SX1280_LORA_HEADER_EXPLICIT,
     .crc_mode           = SX1280_LORA_CRC_ON,
     .iq_mode            = SX1280_LORA_IQ_NORMAL,
@@ -319,7 +332,7 @@ static HAL_StatusTypeDef sx1280_validate_config(const SX1280_LoRaConfig *config)
 
     if ((config->coding_rate < SX1280_LORA_CR_4_5) ||
         (config->coding_rate > SX1280_LORA_CR_LI_4_8) ||
-        (config->preamble_symbols == 0) ||
+        (config->preamble_param == 0) ||
         (config->tx_power_dbm < -18) ||
         (config->tx_power_dbm > 13))
     {
@@ -344,7 +357,7 @@ static HAL_StatusTypeDef sx1280_set_packet_params(const SX1280_LoRaConfig *confi
                                                    uint8_t payload_len)
 {
     uint8_t args[7] = {
-        config->preamble_symbols,
+        config->preamble_param,
         config->header_type,
         payload_len,
         config->crc_mode,
@@ -602,14 +615,24 @@ HAL_StatusTypeDef SX1280_Transmit(const uint8_t *data, uint8_t len, uint32_t tim
     uint16_t irq_status;
     uint32_t start;
     uint8_t tx_args[3] = {
-        0x00,
-        0x00,
-        0x00  /* no radio-side timeout */
+        SX1280_TX_TIMEOUT_BASE_4_MS,
+        (uint8_t)(SX1280_TX_TIMEOUT_COUNT >> 8),
+        (uint8_t)(SX1280_TX_TIMEOUT_COUNT)
     };
 
     if ((data == 0) || (len == 0))
     {
         return HAL_ERROR;
+    }
+
+    /*
+     * The existing radio bridge passes 1000 ms.  That is unnecessarily close
+     * to the worst-case packet time for the long-range profile, so enforce a
+     * safer minimum inside the driver without requiring radio_bridge.c changes.
+     */
+    if (timeout_ms < SX1280_MIN_SOFTWARE_TIMEOUT_MS)
+    {
+        timeout_ms = SX1280_MIN_SOFTWARE_TIMEOUT_MS;
     }
 
     status = sx1280_set_standby();
@@ -646,6 +669,9 @@ HAL_StatusTypeDef SX1280_Transmit(const uint8_t *data, uint8_t len, uint32_t tim
             SX1280_StartRxContinuous();
             return HAL_TIMEOUT;
         }
+
+        /* Avoid continuously occupying SPI while waiting for TxDone. */
+        HAL_Delay(1);
     }
     while ((HAL_GetTick() - start) < timeout_ms);
 

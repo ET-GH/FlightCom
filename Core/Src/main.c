@@ -246,6 +246,8 @@ int main(void)
       }
 
       Behavior_Update(now_ms);
+      // send data
+      RadioBridge_Task(g_behavior_telemetry, now_ms);
 
       float acc = g_behavior_telemetry->ekf_acceleration_m_s2;
       float alt = g_behavior_telemetry->ekf_altitude_m;
@@ -282,18 +284,9 @@ int main(void)
 //
 //      Airbrake_Update(now_ms);
 //      Airbrake_SetTargetPercent((uint8_t) (deploy * 100));
+
 //
       HAL_Delay(10u);
-
-      /*
-       * When BMP388 compensation needs to be implemented
-       *
-       * Behavior_SubmitBarometerAltitudeAGL(compensated_altitude_agl_m, now_ms);
-       *
-       * or, for an absolute MSL altitude:
-       *
-       * Behavior_SubmitBarometerAltitudeMSL(compensated_altitude_msl_m, now_ms);
-       */
 
       /* Physical actuation remains disabled. */
       // Airbrake_Update(now_ms);
