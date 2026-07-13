@@ -20,6 +20,7 @@
 	 * Main is the highest level of abstraction. Handling configuration and subsystem connection.
 	 * the abstraction hierarchy goes like this:
 	 * Main --> Behavior --> rocket_sensors --> sensor drivers -> communication protocol
+	 * 		|			 |--> Fusion
 	 * 		|			 |--> ekf
 	 * 		|			 |--> controller
 	 * 		|			 |--> airbrake --> motor driver --> communication protocol
