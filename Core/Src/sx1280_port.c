@@ -1,5 +1,7 @@
 #include "sx1280_port.h"
 
+//keeping SPI in a different file, you don't need to edit this
+
 extern SPI_HandleTypeDef hspi1;
 
 HAL_StatusTypeDef SX1280_PortInit(void)

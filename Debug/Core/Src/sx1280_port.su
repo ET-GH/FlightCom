@@ -1,6 +1,6 @@
-../Core/Src/sx1280_port.c:5:19:SX1280_PortInit	8	static
-../Core/Src/sx1280_port.c:12:6:SX1280_PortCsLow	8	static
-../Core/Src/sx1280_port.c:17:6:SX1280_PortCsHigh	8	static
-../Core/Src/sx1280_port.c:22:6:SX1280_PortReset	8	static
-../Core/Src/sx1280_port.c:36:19:SX1280_PortWaitBusyLow	24	static
-../Core/Src/sx1280_port.c:51:19:SX1280_PortSpiTxRx	32	static
+../Core/Src/sx1280_port.c:7:19:SX1280_PortInit	8	static
+../Core/Src/sx1280_port.c:14:6:SX1280_PortCsLow	8	static
+../Core/Src/sx1280_port.c:19:6:SX1280_PortCsHigh	8	static
+../Core/Src/sx1280_port.c:24:6:SX1280_PortReset	8	static
+../Core/Src/sx1280_port.c:38:19:SX1280_PortWaitBusyLow	24	static
+../Core/Src/sx1280_port.c:53:19:SX1280_PortSpiTxRx	32	static

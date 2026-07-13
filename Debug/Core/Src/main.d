@@ -45,9 +45,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Core/Inc/Fusion/FusionAhrs.h ../Core/Inc/Fusion/FusionConvention.h \
  ../Core/Inc/Fusion/FusionMath.h ../Core/Inc/Fusion/FusionBias.h \
  ../Core/Inc/Fusion/FusionCompass.h ../Core/Inc/Fusion/FusionModel.h \
- ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/tmc5240.h \
- ../Core/Inc/airbrake.h ../Core/Inc/controller.h ../Core/Inc/behavior.h \
- ../Core/Inc/openrocket_run_data.h
+ ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/airbrake.h \
+ ../Core/Inc/behavior.h
 ../Core/Inc/main.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
 ../Core/Inc/stm32h5xx_hal_conf.h:
@@ -107,8 +106,5 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/Fusion/FusionCompass.h:
 ../Core/Inc/Fusion/FusionModel.h:
 ../Core/Inc/Fusion/FusionRemap.h:
-../Core/Inc/tmc5240.h:
 ../Core/Inc/airbrake.h:
-../Core/Inc/controller.h:
 ../Core/Inc/behavior.h:
-../Core/Inc/openrocket_run_data.h:

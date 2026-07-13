@@ -37,8 +37,7 @@ Core/Src/behavior.o: ../Core/Src/behavior.c ../Core/Inc/behavior.h \
  ../Core/Inc/Fusion/FusionConvention.h ../Core/Inc/Fusion/FusionMath.h \
  ../Core/Inc/Fusion/FusionBias.h ../Core/Inc/Fusion/FusionCompass.h \
  ../Core/Inc/Fusion/FusionModel.h ../Core/Inc/Fusion/FusionRemap.h \
- ../Core/Inc/controller.h ../Core/Inc/airbrake.h ../Core/Inc/main.h \
- ../Core/Inc/tmc5240.h
+ ../Core/Inc/airbrake.h ../Core/Inc/main.h ../Core/Inc/controller.h
 ../Core/Inc/behavior.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
 ../Core/Inc/stm32h5xx_hal_conf.h:
@@ -85,7 +84,6 @@ Core/Src/behavior.o: ../Core/Src/behavior.c ../Core/Inc/behavior.h \
 ../Core/Inc/Fusion/FusionCompass.h:
 ../Core/Inc/Fusion/FusionModel.h:
 ../Core/Inc/Fusion/FusionRemap.h:
-../Core/Inc/controller.h:
 ../Core/Inc/airbrake.h:
 ../Core/Inc/main.h:
-../Core/Inc/tmc5240.h:
+../Core/Inc/controller.h:

@@ -1,2 +1,2 @@
-../Core/Src/rocket_sensors.c:40:19:RocketSensors_Init	4
-../Core/Src/rocket_sensors.c:56:19:RocketSensors_ReadAll	8
+../Core/Src/rocket_sensors.c:88:19:RocketSensors_Init	4
+../Core/Src/rocket_sensors.c:127:19:RocketSensors_ReadAll	8

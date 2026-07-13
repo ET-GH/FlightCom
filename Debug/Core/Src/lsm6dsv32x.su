@@ -1,7 +1,7 @@
-../Core/Src/lsm6dsv32x.c:6:26:lsm6_write_u8	32	static
-../Core/Src/lsm6dsv32x.c:22:26:lsm6_read_u8	40	static
-../Core/Src/lsm6dsv32x.c:42:19:LSM6DSV32X_ReadWhoAmI	16	static
-../Core/Src/lsm6dsv32x.c:55:19:LSM6DSV32X_ReadStatus	16	static
-../Core/Src/lsm6dsv32x.c:68:26:lsm6_read_bytes	40	static
-../Core/Src/lsm6dsv32x.c:84:19:LSM6DSV32X_Init	32	static
-../Core/Src/lsm6dsv32x.c:165:19:LSM6DSV32X_ReadData	40	static
+../Core/Src/lsm6dsv32x.c:7:26:lsm6_write_u8	32	static
+../Core/Src/lsm6dsv32x.c:23:26:lsm6_read_u8	40	static
+../Core/Src/lsm6dsv32x.c:43:19:LSM6DSV32X_ReadWhoAmI	16	static
+../Core/Src/lsm6dsv32x.c:56:19:LSM6DSV32X_ReadStatus	16	static
+../Core/Src/lsm6dsv32x.c:69:26:lsm6_read_bytes	40	static
+../Core/Src/lsm6dsv32x.c:85:19:LSM6DSV32X_Init	32	static
+../Core/Src/lsm6dsv32x.c:167:19:LSM6DSV32X_ReadData	40	static

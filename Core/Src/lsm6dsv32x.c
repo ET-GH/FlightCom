@@ -3,6 +3,7 @@
 #define LSM6DSV32X_I2C_TIMEOUT_MS    100U
 #define LSM6DSV32X_ADDR(dev)         ((uint16_t)((dev)->addr_7bit << 1))
 
+// Helpers
 static HAL_StatusTypeDef lsm6_write_u8(LSM6DSV32X_HandleTypeDef *dev, uint8_t reg, uint8_t value)
 {
     if (dev == NULL || dev->hi2c == NULL)
@@ -162,6 +163,7 @@ HAL_StatusTypeDef LSM6DSV32X_Init(LSM6DSV32X_HandleTypeDef *dev)
     return HAL_OK;
 }
 
+// reads and multiplies data by datasheet weights
 HAL_StatusTypeDef LSM6DSV32X_ReadData(LSM6DSV32X_HandleTypeDef *dev, float data[LSM6DSV32X_DATA_COUNT])
 {
     if (data == NULL)

@@ -1,63 +1,92 @@
+/**
+ * @file behavior.c
+ * @brief Coordinates flight sensing, attitude fusion, altitude estimation,
+ *        apogee control, and built-in diagnostic modes.
+ *
+ * The file is intentionally divided into two major execution paths:
+ *   1. Standard operation using synchronized physical sensors.
+ *   2. Test operation using either live diagnostics or synthetic flight data.
+ *
+ * Test-only state and helpers are kept separate from the standard pipeline so
+ * normal flight behavior can be followed without stepping through simulation
+ * and pass/fail evaluation code.
+ */
+
 #include "behavior.h"
 
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
 
+#include "airbrake.h"
 #include "controller.h"
 
-/*
- * Physical actuation is intentionally disabled for now
- */
-#include "airbrake.h"
-#include "tmc5240.h"
+/* -------------------------------------------------------------------------- */
+/* Physical constants and real-sensor timing                                  */
+/* -------------------------------------------------------------------------- */
 
 #define BEHAVIOR_GRAVITY_M_S2               9.80665f
 #define BEHAVIOR_MIN_DT_S                    0.001f
 #define BEHAVIOR_MAX_DT_S                    0.050f
 #define BEHAVIOR_BARO_STALE_MS               250U
-#define BEHAVIOR_SYNTHETIC_BARO_DIVIDER      5U
+#define BEHAVIOR_BARO_REFERENCE_SAMPLES      50U
+#define BEHAVIOR_BARO_REFERENCE_DELAY_MS     20U
 
-/* Data-ready bits used to guarantee that every EKF cycle uses a fresh sample
- * from every real sensor.  The BMP388 is the slowest configured sensor at
- * 50 Hz, so its data-ready flag naturally limits the real EKF to at most 50 Hz.
- */
-#define BEHAVIOR_IMU_READY_MASK               0x03U /* XLDA | GDA */
-#define BEHAVIOR_MAG_READY_MASK               0x08U /* ZYXDA */
-#define BEHAVIOR_BARO_READY_MASK              0x60U /* drdy_press | drdy_temp */
+/* A real pipeline cycle is accepted only when every sensor has fresh data. */
+#define BEHAVIOR_IMU_READY_MASK              0x03U /* XLDA | GDA */
+#define BEHAVIOR_MAG_READY_MASK              0x08U /* ZYXDA */
+#define BEHAVIOR_BARO_READY_MASK             0x60U /* pressure | temperature */
 
-#define BEHAVIOR_BARO_REFERENCE_SAMPLES       50U
-#define BEHAVIOR_BARO_REFERENCE_DELAY_MS      20U
+/* -------------------------------------------------------------------------- */
+/* Altitude EKF tuning                                                        */
+/* -------------------------------------------------------------------------- */
 
 #define BEHAVIOR_EKF_VAR_BARO                2.25f
 #define BEHAVIOR_EKF_VAR_IMU_ACCEL           0.16f
 #define BEHAVIOR_EKF_VAR_PROCESS_JERK       25.0f
 #define BEHAVIOR_EKF_VAR_PROCESS_BIAS        0.0001f
 
+/* -------------------------------------------------------------------------- */
+/* Synthetic-test model                                                       */
+/* -------------------------------------------------------------------------- */
+
+#define BEHAVIOR_SYNTHETIC_BARO_DIVIDER      5U
 #define BEHAVIOR_SYNTH_ACCEL_BIAS_M_S2       0.20f
 #define BEHAVIOR_SYNTH_GYRO_BIAS_DPS         0.40f
 #define BEHAVIOR_SYNTH_ACCEL_NOISE_M_S2      0.20f
 #define BEHAVIOR_SYNTH_GYRO_NOISE_DPS        0.08f
-#define BEHAVIOR_SYNTH_MAG_NOISE              0.005f
+#define BEHAVIOR_SYNTH_MAG_NOISE             0.005f
 #define BEHAVIOR_SYNTH_BARO_NOISE_M           1.50f
 
-// logic classes
+/* -------------------------------------------------------------------------- */
+/* Module state: standard operation                                           */
+/* -------------------------------------------------------------------------- */
+
 static AltitudeEKF_t altitude_ekf;
 static Controller controller;
 static FusionAhrs fusion_ahrs;
 static FusionBias fusion_bias;
 
-// data
 static BehaviorConfig_t behavior_config;
 static volatile BehaviorTelemetry_t telemetry;
 
-// timing
-/* last_sensor_attempt_ms controls status polling.  last_sensor_update_ms is
- * advanced only after one complete synchronized IMU + magnetometer +
- * barometer sample has been acquired successfully.
- */
+/* Sensor polling and completed-sample timing are tracked separately. */
 static uint32_t last_sensor_attempt_ms;
 static uint32_t last_sensor_update_ms;
+
+static FusionVector latest_magnetometer;
+static bool latest_magnetometer_valid;
+
+/* Sequence numbers ensure that each submitted barometer value is used once. */
+static float submitted_baro_altitude_agl_m;
+static uint32_t submitted_baro_timestamp_ms;
+static uint32_t submitted_baro_sequence;
+static uint32_t consumed_baro_sequence;
+
+/* -------------------------------------------------------------------------- */
+/* Module state: synthetic tests                                              */
+/* -------------------------------------------------------------------------- */
+
 static uint32_t last_synthetic_update_ms;
 static uint32_t synthetic_baro_counter;
 static float synthetic_ekf_elapsed_s;
@@ -65,96 +94,69 @@ static float synthetic_accel_sum_m_s2;
 static uint32_t synthetic_accel_count;
 static uint32_t noise_state;
 
-static FusionVector latest_magnetometer;
-static bool latest_magnetometer_valid;
-
-static float submitted_baro_altitude_agl_m;
-static uint32_t submitted_baro_timestamp_ms;
-static uint32_t submitted_baro_sequence;
-static uint32_t consumed_baro_sequence;
-
 static float synthetic_time_s;
 static float synthetic_previous_velocity_m_s;
 static FusionQuaternion synthetic_truth_quaternion;
 
-// change between a testing or standard mode
+/* -------------------------------------------------------------------------- */
+/* Private declarations                                                       */
+/* -------------------------------------------------------------------------- */
+
+/* Configuration and mode-state helpers. */
 static void Behavior_EnterMode(BehaviorMode_t mode,
                                uint32_t duration_ms,
                                uint32_t now_ms);
-// verify mode
-static bool Behavior_IsSupportedMode(BehaviorMode_t mode);
-// verify configuration data
 static bool Behavior_ValidateConfig(const BehaviorConfig_t *config);
-// transfer config data to the main data struct
 static void Behavior_CopyConfigToTelemetry(void);
-// reset/init fusion
 static void Behavior_ResetFusion(void);
-// reset/init controller
 static void Behavior_ResetEstimatorController(uint32_t now_ms);
-// reset synthetic data to 0
-static void Behavior_ResetSyntheticTest(uint32_t now_ms,
-                                        bool reset_fusion);
-// update logic for each behavior
-static void Behavior_UpdateStandard(uint32_t now_ms);
-static void Behavior_UpdateRawSensorTest(uint32_t now_ms);
-static void Behavior_UpdateSyntheticEkfTest(uint32_t now_ms);
-static void Behavior_UpdateFusionTest(uint32_t now_ms);
-static void Behavior_UpdateRealImuEkfTest(uint32_t now_ms);
-static void Behavior_UpdateFullPipelineTest(uint32_t now_ms);
 
-// collect samples and measure period
+/* Standard real-sensor processing pipeline. */
 static bool Behavior_ReadAndConvertSensors(uint32_t now_ms,
                                            float *dt_s);
-// raw through fusion vectors
 static void Behavior_ConvertRawSensors(FusionVector *gyroscope,
                                        FusionVector *accelerometer,
                                        FusionVector *magnetometer);
-// fusion logic
-static void Behavior_UpdateFusion(const FusionVector gyroscope,
-                                  const FusionVector accelerometer,
-                                  const FusionVector magnetometer,
+static void Behavior_UpdateFusion(FusionVector gyroscope,
+                                  FusionVector accelerometer,
+                                  FusionVector magnetometer,
                                   bool magnetometer_valid,
                                   float dt_s);
-// pipeline logic
 static void Behavior_UpdateRealPipeline(uint32_t now_ms,
                                         bool update_ekf,
                                         bool update_controller);
-// pass baro through ekf
 static void Behavior_ConsumeBarometerCorrection(uint32_t now_ms);
-// pass data through controller
-static void Behavior_UpdateController(uint32_t now_ms, float dt_s,
+static void Behavior_UpdateController(float dt_s,
                                       bool allow_deployment);
-// push data from ekf to telemetry struct
 static void Behavior_CopyEkfTelemetry(void);
-// push data from fusion to telemetry struct
-static void Behavior_CopyFusionTelemetry(const FusionVector earth_acceleration);
-// increment synthetic data and flight conditions
+static void Behavior_CopyFusionTelemetry(FusionVector earth_acceleration);
+
+/* Test-mode entry points and synthetic-flight support. */
+static void Behavior_ResetSyntheticTest(uint32_t now_ms,
+                                        bool reset_fusion);
+static void Behavior_UpdateRawSensorTest(uint32_t now_ms);
+static void Behavior_UpdateSyntheticEkfTest(uint32_t now_ms);
+static void Behavior_UpdateFusionTest(uint32_t now_ms);
+static void Behavior_UpdateFullPipelineTest(uint32_t now_ms);
 static void Behavior_AdvanceSyntheticDynamics(float dt_s);
-// return fusion data of rocket
 static FusionVector Behavior_GetSyntheticBodyRate(void);
-// fusion quaternion don't make sense to me but it seems important, I didn't bother trying to understand (thank you ai)
 static void Behavior_UpdateTruthQuaternion(FusionVector body_rate_dps,
                                            float dt_s);
-// align vectors and reference
 static FusionVector Behavior_RotateEarthToBody(FusionVector earth_vector,
                                                FusionQuaternion body_to_earth);
-// simulate sensors w/ noise
 static void Behavior_CreateSyntheticSensors(FusionVector body_rate_truth,
                                             FusionVector *gyroscope,
                                             FusionVector *accelerometer,
                                             FusionVector *magnetometer);
-// update entire telemetry struct
 static void Behavior_UpdateSyntheticTruthTelemetry(FusionVector gyroscope,
                                                    FusionVector accelerometer,
                                                    FusionVector magnetometer);
-// update errors and the like
 static void Behavior_UpdateTestMetrics(void);
-// verify test results
 static void Behavior_FinalizeApogeeResult(void);
-// status update on estimator
+
+/* Timing and math helpers shared by standard and test paths. */
 static float Behavior_GetUpdatePeriodSeconds(void);
 static uint32_t Behavior_GetUpdatePeriodMilliseconds(void);
-// math helpers
 static float Behavior_ClampFloat(float value,
                                  float minimum,
                                  float maximum);
@@ -163,10 +165,15 @@ static float Behavior_AngleDifferenceDegrees(float estimate,
                                              float truth);
 static float Behavior_Noise(float amplitude);
 static bool Behavior_Finite(float value);
-// vector alignment again
-static float Behavior_EarthVerticalToPositiveUp(FusionVector earth_acceleration);
 
-// configuration of behavior and default values
+/* ========================================================================== */
+/* Public API: configuration and lifecycle                                    */
+/* ========================================================================== */
+
+/**
+ * @brief Populate a configuration structure with safe module defaults.
+ * @param config Destination configuration. A NULL pointer is ignored.
+ */
 void Behavior_DefaultConfig(BehaviorConfig_t *config)
 {
     if (config == NULL)
@@ -174,10 +181,10 @@ void Behavior_DefaultConfig(BehaviorConfig_t *config)
         return;
     }
 
-    // allocate space
+    /* Initialize every field before assigning documented defaults. */
     memset(config, 0, sizeof(*config));
 
-    // replace default values
+    /* Flight objective and launch-site reference. */
     config->target_apogee_m = 100.0f;
     config->initial_altitude_agl_m = 0.0f;
     config->launch_site_altitude_msl_m = 0.0f;
@@ -205,7 +212,7 @@ void Behavior_DefaultConfig(BehaviorConfig_t *config)
     config->mag_hard_iron_offset = FUSION_VECTOR_ZERO;
     config->mag_soft_iron_matrix = FUSION_MATRIX_IDENTITY;
 
-    config->altitude_tolerance_m = 9.144f; /* 30 ft  because I thought that was fair*/
+    config->altitude_tolerance_m = 9.144f; /* Default acceptance band: 30 ft. */
     config->fusion_roll_tolerance_deg = 10.0f;
     config->fusion_pitch_tolerance_deg = 10.0f;
     config->fusion_yaw_tolerance_deg = 15.0f;
@@ -217,7 +224,12 @@ void Behavior_DefaultConfig(BehaviorConfig_t *config)
     config->synthetic_airbrake_drag_k = 0.0040f;
 }
 
-// initialize behavior
+/**
+ * @brief Initialize sensors, estimator, controller, telemetry, and mode state.
+ * @param config Optional validated configuration; defaults are used when NULL or invalid.
+ * @param now_ms Entry timestamp. Post-calibration timing is rebased to HAL_GetTick().
+ * @return HAL status from sensor initialization or barometer reference calibration.
+ */
 HAL_StatusTypeDef Behavior_Init(const BehaviorConfig_t *config,
                                 uint32_t now_ms)
 {
@@ -225,7 +237,9 @@ HAL_StatusTypeDef Behavior_Init(const BehaviorConfig_t *config,
     BehaviorConfig_t defaults;
     uint32_t init_complete_ms;
 
+    /* Use validated caller settings or fall back to the module defaults. */
     Behavior_DefaultConfig(&defaults);
+
 
     if ((config != NULL) && Behavior_ValidateConfig(config))
     {
@@ -236,16 +250,19 @@ HAL_StatusTypeDef Behavior_Init(const BehaviorConfig_t *config,
         behavior_config = defaults;
     }
 
-    // allocate telemetry
+    /* Clear all externally visible state before initializing subsystems. */
     memset((void *)&telemetry, 0, sizeof(telemetry));
+
     latest_magnetometer = FUSION_VECTOR_ZERO;
     latest_magnetometer_valid = false;
 
+    /* Initialize the asynchronous barometer handoff state. */
     submitted_baro_altitude_agl_m = behavior_config.initial_altitude_agl_m;
     submitted_baro_timestamp_ms = now_ms;
     submitted_baro_sequence = 0U;
     consumed_baro_sequence = 0U;
 
+    /* Deterministic seed keeps synthetic tests reproducible. */
     noise_state = 0x13579BDFU;
 
     sensor_status = RocketSensors_Init();
@@ -259,13 +276,14 @@ HAL_StatusTypeDef Behavior_Init(const BehaviorConfig_t *config,
             BEHAVIOR_BARO_REFERENCE_SAMPLES,
             BEHAVIOR_BARO_REFERENCE_DELAY_MS);
     }
-
     /* Calibration is intentionally blocking, so reset all timing from the
      * actual completion time instead of the timestamp passed at entry.
      */
     init_complete_ms = HAL_GetTick();
 
+
     Behavior_ResetFusion();
+
     Behavior_ResetEstimatorController(init_complete_ms);
 
     telemetry.initialized = true;
@@ -274,7 +292,9 @@ HAL_StatusTypeDef Behavior_Init(const BehaviorConfig_t *config,
         : BEHAVIOR_STATUS_SENSOR_INIT_FAILED;
 
     Behavior_CopyConfigToTelemetry();
+    /* Prepare test state even though standard mode is selected below. */
     Behavior_ResetSyntheticTest(init_complete_ms, true);
+
     Behavior_EnterMode(BEHAVIOR_MODE_STANDARD, 0U, init_complete_ms);
 
     /* Behavior_EnterMode() sets status to OK, so restore an initialization
@@ -287,10 +307,16 @@ HAL_StatusTypeDef Behavior_Init(const BehaviorConfig_t *config,
     return sensor_status;
 }
 
-// input config into starting values for everything it applies to
+/**
+ * @brief Replace the active configuration and reset dependent processing state.
+ * @param config Complete configuration to validate and apply.
+ * @param now_ms Timestamp used to restart estimator and test timing.
+ * @return Current behavior status.
+ */
 BehaviorStatus_t Behavior_ApplyConfig(const BehaviorConfig_t *config,
                                       uint32_t now_ms)
 {
+    /* Reject invalid settings without disturbing the active configuration. */
     if (!Behavior_ValidateConfig(config))
     {
         telemetry.status = BEHAVIOR_STATUS_INVALID_CONFIG;
@@ -298,6 +324,7 @@ BehaviorStatus_t Behavior_ApplyConfig(const BehaviorConfig_t *config,
     }
 
     behavior_config = *config;
+    /* Reinitialize state that depends on configuration values. */
     Behavior_CopyConfigToTelemetry();
     Behavior_ResetFusion();
     Behavior_ResetEstimatorController(now_ms);
@@ -307,9 +334,13 @@ BehaviorStatus_t Behavior_ApplyConfig(const BehaviorConfig_t *config,
     return telemetry.status;
 }
 
+/**
+ * @brief Update the target apogee and restart the controller around that target.
+ */
 BehaviorStatus_t Behavior_SetTargetApogee(float target_apogee_m,
                                           uint32_t now_ms)
 {
+    /* Reject non-finite or physically invalid input. */
     if (!Behavior_Finite(target_apogee_m) ||
         (target_apogee_m <= behavior_config.initial_altitude_agl_m))
     {
@@ -318,6 +349,7 @@ BehaviorStatus_t Behavior_SetTargetApogee(float target_apogee_m,
     }
 
     behavior_config.target_apogee_m = target_apogee_m;
+    /* A new target requires a fresh controller state. */
     Controller_Init(&controller, target_apogee_m);
     Behavior_CopyConfigToTelemetry();
     (void)now_ms;
@@ -326,9 +358,13 @@ BehaviorStatus_t Behavior_SetTargetApogee(float target_apogee_m,
     return telemetry.status;
 }
 
+/**
+ * @brief Update the estimator's initial above-ground altitude and reset the EKF.
+ */
 BehaviorStatus_t Behavior_SetInitialAltitudeAGL(float initial_altitude_agl_m,
                                                 uint32_t now_ms)
 {
+    /* Reject non-finite or physically invalid input. */
     if (!Behavior_Finite(initial_altitude_agl_m) ||
         (initial_altitude_agl_m >= behavior_config.target_apogee_m))
     {
@@ -337,6 +373,7 @@ BehaviorStatus_t Behavior_SetInitialAltitudeAGL(float initial_altitude_agl_m,
     }
 
     behavior_config.initial_altitude_agl_m = initial_altitude_agl_m;
+    /* Rebase the estimator on the new initial altitude. */
     Behavior_CopyConfigToTelemetry();
     Behavior_ResetEstimatorController(now_ms);
 
@@ -344,9 +381,13 @@ BehaviorStatus_t Behavior_SetInitialAltitudeAGL(float initial_altitude_agl_m,
     return telemetry.status;
 }
 
+/**
+ * @brief Set the normalized minimum and maximum controller deployment limits.
+ */
 BehaviorStatus_t Behavior_SetDeploymentBounds(float deployment_min,
                                               float deployment_max)
 {
+    /* Reject non-finite or physically invalid input. */
     if (!Behavior_Finite(deployment_min) ||
         !Behavior_Finite(deployment_max) ||
         (deployment_min < 0.0f) ||
@@ -357,6 +398,7 @@ BehaviorStatus_t Behavior_SetDeploymentBounds(float deployment_min,
         return telemetry.status;
     }
 
+    /* Commit the validated bounds. */
     behavior_config.deployment_min = deployment_min;
     behavior_config.deployment_max = deployment_max;
     Behavior_CopyConfigToTelemetry();
@@ -365,32 +407,46 @@ BehaviorStatus_t Behavior_SetDeploymentBounds(float deployment_min,
     return telemetry.status;
 }
 
+/**
+ * @brief Enable or disable closed-loop deployment commands.
+ *
+ * Disabling control also commands zero percent deployment immediately.
+ */
 BehaviorStatus_t Behavior_SetControllerEnabled(bool enabled)
 {
     behavior_config.controller_enabled = enabled;
     Behavior_CopyConfigToTelemetry();
 
+    /* Retract the commanded airbrake immediately when control is disabled. */
     if (!enabled)
     {
         telemetry.controller_raw_deployment = 0.0f;
         telemetry.controller_requested_deployment = 0.0f;
         telemetry.controller_requested_percent = 0U;
         telemetry.controller_active = false;
+        (void)Airbrake_SetTargetPercent(0U);
     }
 
     telemetry.status = BEHAVIOR_STATUS_OK;
     return telemetry.status;
 }
 
+/**
+ * @brief Submit an externally obtained AGL barometer measurement.
+ *
+ * The sequence counter allows the EKF to consume each correction at most once.
+ */
 BehaviorStatus_t Behavior_SubmitBarometerAltitudeAGL(float altitude_agl_m,
                                                      uint32_t now_ms)
 {
+    /* Reject non-finite or physically invalid input. */
     if (!Behavior_Finite(altitude_agl_m))
     {
         telemetry.status = BEHAVIOR_STATUS_BAD_ARGUMENT;
         return telemetry.status;
     }
 
+    /* Publish the sample and advance its sequence number atomically. */
     submitted_baro_altitude_agl_m = altitude_agl_m;
     submitted_baro_timestamp_ms = now_ms;
     submitted_baro_sequence++;
@@ -402,6 +458,9 @@ BehaviorStatus_t Behavior_SubmitBarometerAltitudeAGL(float altitude_agl_m,
     return BEHAVIOR_STATUS_OK;
 }
 
+/**
+ * @brief Convert an MSL altitude to AGL and submit it as a barometer correction.
+ */
 BehaviorStatus_t Behavior_SubmitBarometerAltitudeMSL(float altitude_msl_m,
                                                      uint32_t now_ms)
 {
@@ -416,7 +475,16 @@ BehaviorStatus_t Behavior_SubmitBarometerAltitudeMSL(float altitude_msl_m,
         now_ms);
 }
 
-// step the current behavior. no logic is stored here, different modes will have different behaviors
+/* ========================================================================== */
+/* Public API: runtime and mode control                                       */
+/* ========================================================================== */
+
+/**
+ * @brief Execute one non-blocking behavior update for the active mode.
+ *
+ * Standard operation and real-IMU EKF testing share the real sensor pipeline.
+ * Synthetic and diagnostic modes are dispatched to the dedicated test section.
+ */
 void Behavior_Update(uint32_t now_ms)
 {
     telemetry.mode_changed = false;
@@ -438,7 +506,7 @@ void Behavior_Update(uint32_t now_ms)
     switch (telemetry.mode)
     {
         case BEHAVIOR_MODE_STANDARD:
-            Behavior_UpdateStandard(now_ms);
+            Behavior_UpdateRealPipeline(now_ms, true, true);
             break;
 
         case BEHAVIOR_MODE_TEST_RAW_SENSORS:
@@ -454,7 +522,7 @@ void Behavior_Update(uint32_t now_ms)
             break;
 
         case BEHAVIOR_MODE_TEST_REAL_IMU_EKF:
-            Behavior_UpdateRealImuEkfTest(now_ms);
+            Behavior_UpdateRealPipeline(now_ms, true, true);
             break;
 
         case BEHAVIOR_MODE_TEST_FULL_PIPELINE:
@@ -467,21 +535,20 @@ void Behavior_Update(uint32_t now_ms)
             break;
     }
 
-    /*
-     * Physical airbrake and motor output remains disabled.
-     * controller_requested_percent is available for inspection/telemetry.
-     */
-    //Airbrake_Update(now_ms);
-    //Airbrake_SetTargetPercent(telemetry.controller_requested_percent);
-    // TMC5240_EnableDriver();
+    /* Advance actuator state after the selected behavior computes its target. */
+    Airbrake_Update(now_ms);
 }
 
-// attempt to set the mode
+/**
+ * @brief Enter a supported standard or test mode.
+ * @param duration_ms Optional automatic return delay; zero disables auto-return.
+ */
 BehaviorStatus_t Behavior_RequestMode(BehaviorMode_t mode,
                                       uint32_t duration_ms,
                                       uint32_t now_ms)
 {
-    if (!Behavior_IsSupportedMode(mode))
+    if ((mode < BEHAVIOR_MODE_STANDARD) ||
+        (mode > BEHAVIOR_MODE_TEST_FULL_PIPELINE))
     {
         telemetry.status = BEHAVIOR_STATUS_UNSUPPORTED_MODE;
         return telemetry.status;
@@ -491,26 +558,37 @@ BehaviorStatus_t Behavior_RequestMode(BehaviorMode_t mode,
     return BEHAVIOR_STATUS_OK;
 }
 
+/** @brief Return immediately to standard flight operation. */
 void Behavior_ReturnToStandard(uint32_t now_ms)
 {
     Behavior_EnterMode(BEHAVIOR_MODE_STANDARD, 0U, now_ms);
 }
 
+/** @brief Return the currently active behavior mode. */
 BehaviorMode_t Behavior_GetMode(void)
 {
     return telemetry.mode;
 }
 
+/** @brief Return a read-only pointer to the active configuration. */
 const BehaviorConfig_t *Behavior_GetConfig(void)
 {
     return &behavior_config;
 }
 
+/** @brief Return a read-only volatile view of current telemetry. */
 const volatile BehaviorTelemetry_t *Behavior_GetTelemetry(void)
 {
     return &telemetry;
 }
 
+/* ========================================================================== */
+/* Private configuration, reset, and mode management                          */
+/* ========================================================================== */
+
+/**
+ * @brief Commit a mode transition and reset only the state required by that mode.
+ */
 static void Behavior_EnterMode(BehaviorMode_t mode,
                                uint32_t duration_ms,
                                uint32_t now_ms)
@@ -562,14 +640,9 @@ static void Behavior_EnterMode(BehaviorMode_t mode,
     }
 }
 
-// verify if mode actually exists
-static bool Behavior_IsSupportedMode(BehaviorMode_t mode)
-{
-    return (mode >= BEHAVIOR_MODE_STANDARD) &&
-           (mode <= BEHAVIOR_MODE_TEST_FULL_PIPELINE);
-}
-
-// verify if config is possible
+/**
+ * @brief Verify numeric validity and supported operating ranges for a configuration.
+ */
 static bool Behavior_ValidateConfig(const BehaviorConfig_t *config)
 {
     if (config == NULL)
@@ -597,7 +670,7 @@ static bool Behavior_ValidateConfig(const BehaviorConfig_t *config)
            (config->synthetic_airbrake_drag_k >= 0.0f);
 }
 
-// push config to telemetry struct
+/** @brief Publish user-visible configuration fields to telemetry. */
 static void Behavior_CopyConfigToTelemetry(void)
 {
     telemetry.target_apogee_m = behavior_config.target_apogee_m;
@@ -609,6 +682,9 @@ static void Behavior_CopyConfigToTelemetry(void)
     telemetry.controller_enabled = behavior_config.controller_enabled;
 }
 
+/**
+ * @brief Reinitialize gyroscope-bias compensation and the Fusion AHRS instance.
+ */
 static void Behavior_ResetFusion(void)
 {
     FusionBiasSettings bias_settings;
@@ -638,6 +714,9 @@ static void Behavior_ResetFusion(void)
     latest_magnetometer_valid = false;
 }
 
+/**
+ * @brief Reinitialize the altitude EKF, apogee controller, and related telemetry.
+ */
 static void Behavior_ResetEstimatorController(uint32_t now_ms)
 {
     AltitudeEKF_Init(&altitude_ekf,
@@ -664,266 +743,16 @@ static void Behavior_ResetEstimatorController(uint32_t now_ms)
     telemetry.controller_active = false;
 }
 
-static void Behavior_ResetSyntheticTest(uint32_t now_ms,
-                                        bool reset_fusion)
-{
-    if (reset_fusion)
-    {
-        Behavior_ResetFusion();
-    }
+/* ========================================================================== */
+/* Standard operation: synchronized real-sensor pipeline                      */
+/* ========================================================================== */
 
-    synthetic_time_s = 0.0f;
-    synthetic_previous_velocity_m_s = 0.0f;
-    synthetic_baro_counter = 0U;
-    synthetic_ekf_elapsed_s = 0.0f;
-    synthetic_accel_sum_m_s2 = 0.0f;
-    synthetic_accel_count = 0U;
-    synthetic_truth_quaternion = FUSION_QUATERNION_IDENTITY;
-    last_synthetic_update_ms = now_ms;
-
-    telemetry.flight_phase = BEHAVIOR_FLIGHT_PHASE_PAD;
-    telemetry.test_time_s = 0.0f;
-    telemetry.test_flight_time_s = 0.0f;
-    telemetry.test_true_altitude_m = behavior_config.initial_altitude_agl_m;
-    telemetry.test_true_velocity_m_s = 0.0f;
-    telemetry.test_true_acceleration_m_s2 = 0.0f;
-    telemetry.test_roll_deg = 0.0f;
-    telemetry.test_pitch_deg = 0.0f;
-    telemetry.test_yaw_deg = 0.0f;
-
-    telemetry.fusion_roll_error_deg = 0.0f;
-    telemetry.fusion_pitch_error_deg = 0.0f;
-    telemetry.fusion_yaw_error_deg = 0.0f;
-    telemetry.max_fusion_roll_error_deg = 0.0f;
-    telemetry.max_fusion_pitch_error_deg = 0.0f;
-    telemetry.max_fusion_yaw_error_deg = 0.0f;
-
-    telemetry.altitude_error_m = 0.0f;
-    telemetry.velocity_error_m_s = 0.0f;
-    telemetry.max_altitude_error_m = 0.0f;
-    telemetry.max_velocity_error_m_s = 0.0f;
-
-    telemetry.true_apogee_m = behavior_config.initial_altitude_agl_m;
-    telemetry.estimated_apogee_m = behavior_config.initial_altitude_agl_m;
-    telemetry.true_apogee_error_m = 0.0f;
-    telemetry.apogee_reached = false;
-
-    telemetry.fusion_data_valid = false;
-    telemetry.fusion_within_tolerance = false;
-    telemetry.ekf_data_valid = false;
-    telemetry.ekf_within_altitude_tolerance = false;
-    telemetry.controller_output_valid = false;
-    telemetry.controller_apogee_within_tolerance = false;
-    telemetry.full_pipeline_complete = false;
-    telemetry.full_pipeline_pass = false;
-
-    telemetry.synthetic_samples = 0U;
-    telemetry.full_pipeline_samples = 0U;
-}
-
-static void Behavior_UpdateStandard(uint32_t now_ms)
-{
-    Behavior_UpdateRealPipeline(now_ms, true, true);
-}
-// step sensor measurement
-static void Behavior_UpdateRawSensorTest(uint32_t now_ms)
-{
-    float dt_s;
-    FusionVector gyroscope;
-    FusionVector accelerometer;
-    FusionVector magnetometer;
-
-    if (!Behavior_ReadAndConvertSensors(now_ms, &dt_s))
-    {
-        return;
-    }
-
-    Behavior_ConvertRawSensors(&gyroscope, &accelerometer, &magnetometer);
-    (void)dt_s;
-
-    telemetry.controller_active = false;
-    telemetry.controller_requested_deployment = 0.0f;
-    telemetry.controller_requested_percent = 0U;
-}
-// step synthetic data for ekf
-static void Behavior_UpdateSyntheticEkfTest(uint32_t now_ms)
-{
-    const uint32_t period_ms = Behavior_GetUpdatePeriodMilliseconds();
-    const float dt_s = Behavior_GetUpdatePeriodSeconds();
-    float measured_acceleration;
-    float synchronized_acceleration;
-
-    if ((uint32_t)(now_ms - last_synthetic_update_ms) < period_ms)
-    {
-        return;
-    }
-
-    last_synthetic_update_ms += period_ms;
-
-    if (telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_LANDED)
-    {
-        return;
-    }
-
-    Behavior_AdvanceSyntheticDynamics(dt_s);
-
-    measured_acceleration = telemetry.test_true_acceleration_m_s2 +
-                            BEHAVIOR_SYNTH_ACCEL_BIAS_M_S2 +
-                            Behavior_Noise(BEHAVIOR_SYNTH_ACCEL_NOISE_M_S2);
-
-    telemetry.vertical_acceleration_m_s2 = measured_acceleration;
-    telemetry.synthetic_samples++;
-    telemetry.fusion_data_valid = false;
-    telemetry.fusion_within_tolerance = false;
-
-    /* The synthetic IMU is faster than the synthetic barometer.  Accumulate
-     * IMU measurements, but do not update the EKF until a new barometer sample
-     * is available so the test follows the same synchronization rule as the
-     * real pipeline.
-     */
-    synthetic_ekf_elapsed_s += dt_s;
-    synthetic_accel_sum_m_s2 += measured_acceleration;
-    synthetic_accel_count++;
-    synthetic_baro_counter++;
-
-    if (synthetic_baro_counter < BEHAVIOR_SYNTHETIC_BARO_DIVIDER)
-    {
-        return;
-    }
-
-    synthetic_baro_counter = 0U;
-    synchronized_acceleration = synthetic_accel_sum_m_s2 /
-                                (float)synthetic_accel_count;
-
-    AltitudeEKF_UpdateImu(&altitude_ekf,
-                          synchronized_acceleration,
-                          synthetic_ekf_elapsed_s);
-    AltitudeEKF_UpdateBaro(
-        &altitude_ekf,
-        telemetry.test_true_altitude_m +
-        Behavior_Noise(BEHAVIOR_SYNTH_BARO_NOISE_M));
-    telemetry.barometer_correction_used = true;
-
-    Behavior_CopyEkfTelemetry();
-    Behavior_UpdateController(now_ms,
-        synthetic_ekf_elapsed_s,
-        telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_COAST);
-
-    synthetic_ekf_elapsed_s = 0.0f;
-    synthetic_accel_sum_m_s2 = 0.0f;
-    synthetic_accel_count = 0U;
-
-    Behavior_UpdateTestMetrics();
-}
-// synthetic fusion test
-static void Behavior_UpdateFusionTest(uint32_t now_ms)
-{
-    float dt_s;
-    FusionVector gyroscope;
-    FusionVector accelerometer;
-    FusionVector magnetometer;
-
-    if (!Behavior_ReadAndConvertSensors(now_ms, &dt_s))
-    {
-        return;
-    }
-
-    Behavior_ConvertRawSensors(&gyroscope, &accelerometer, &magnetometer);
-    Behavior_UpdateFusion(gyroscope,
-                          accelerometer,
-                          magnetometer,
-                          latest_magnetometer_valid,
-                          dt_s);
-
-    telemetry.controller_active = false;
-    telemetry.controller_requested_deployment = 0.0f;
-    telemetry.controller_requested_percent = 0U;
-}
-// update IMU ekf
-static void Behavior_UpdateRealImuEkfTest(uint32_t now_ms)
-{
-    Behavior_UpdateRealPipeline(now_ms, true, true);
-}
-// pipeline test step
-static void Behavior_UpdateFullPipelineTest(uint32_t now_ms)
-{
-    const uint32_t period_ms = Behavior_GetUpdatePeriodMilliseconds();
-    const float dt_s = Behavior_GetUpdatePeriodSeconds();
-    FusionVector body_rate_truth;
-    FusionVector gyroscope;
-    FusionVector accelerometer;
-    FusionVector magnetometer;
-    float synchronized_acceleration;
-
-    if ((uint32_t)(now_ms - last_synthetic_update_ms) < period_ms)
-    {
-        return;
-    }
-
-    last_synthetic_update_ms += period_ms;
-
-    if (telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_LANDED)
-    {
-        return;
-    }
-
-    Behavior_AdvanceSyntheticDynamics(dt_s);
-
-    body_rate_truth = Behavior_GetSyntheticBodyRate();
-    Behavior_UpdateTruthQuaternion(body_rate_truth, dt_s);
-    Behavior_CreateSyntheticSensors(body_rate_truth,
-                                    &gyroscope,
-                                    &accelerometer,
-                                    &magnetometer);
-    Behavior_UpdateSyntheticTruthTelemetry(gyroscope,
-                                           accelerometer,
-                                           magnetometer);
-
-    /* Fusion may run at the faster IMU rate.  Only the EKF is locked to the
-     * slowest sensor, matching the real-sensor pipeline.
-     */
-    Behavior_UpdateFusion(gyroscope,
-                          accelerometer,
-                          magnetometer,
-                          true,
-                          dt_s);
-
-    telemetry.full_pipeline_samples++;
-    synthetic_ekf_elapsed_s += dt_s;
-    synthetic_accel_sum_m_s2 += telemetry.vertical_acceleration_m_s2;
-    synthetic_accel_count++;
-    synthetic_baro_counter++;
-
-    if (synthetic_baro_counter < BEHAVIOR_SYNTHETIC_BARO_DIVIDER)
-    {
-        return;
-    }
-
-    synthetic_baro_counter = 0U;
-    synchronized_acceleration = synthetic_accel_sum_m_s2 /
-                                (float)synthetic_accel_count;
-
-    AltitudeEKF_UpdateImu(&altitude_ekf,
-                          synchronized_acceleration,
-                          synthetic_ekf_elapsed_s);
-    AltitudeEKF_UpdateBaro(
-        &altitude_ekf,
-        telemetry.test_true_altitude_m +
-        Behavior_Noise(BEHAVIOR_SYNTH_BARO_NOISE_M));
-    telemetry.barometer_correction_used = true;
-
-    Behavior_CopyEkfTelemetry();
-    Behavior_UpdateController(now_ms,
-        synthetic_ekf_elapsed_s,
-        telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_COAST);
-
-    synthetic_ekf_elapsed_s = 0.0f;
-    synthetic_accel_sum_m_s2 = 0.0f;
-    synthetic_accel_count = 0U;
-
-    Behavior_UpdateTestMetrics();
-}
-// collect raw data
+/**
+ * @brief Acquire one synchronized IMU, magnetometer, and barometer sample set.
+ *
+ * No sample is committed unless all three devices report fresh data and every read
+ * succeeds. The returned dt is measured between complete synchronized sets.
+ */
 static bool Behavior_ReadAndConvertSensors(uint32_t now_ms,
                                            float *dt_s)
 {
@@ -1066,7 +895,10 @@ static bool Behavior_ReadAndConvertSensors(uint32_t now_ms,
     telemetry.status = BEHAVIOR_STATUS_OK;
     return true;
 }
-// raw data to usable data
+
+/**
+ * @brief Scale, calibrate, align, and publish the latest raw IMU/magnetometer data.
+ */
 static void Behavior_ConvertRawSensors(FusionVector *gyroscope,
                                        FusionVector *accelerometer,
                                        FusionVector *magnetometer)
@@ -1142,7 +974,10 @@ static void Behavior_ConvertRawSensors(FusionVector *gyroscope,
     telemetry.mag[1] = magnetometer->axis.y;
     telemetry.mag[2] = magnetometer->axis.z;
 }
-// step fusion process
+
+/**
+ * @brief Update gyro-bias estimation and AHRS orientation for one sensor sample.
+ */
 static void Behavior_UpdateFusion(const FusionVector gyroscope,
                                   const FusionVector accelerometer,
                                   const FusionVector magnetometer,
@@ -1173,7 +1008,11 @@ static void Behavior_UpdateFusion(const FusionVector gyroscope,
     Behavior_CopyFusionTelemetry(earth_acceleration);
 }
 
-// step rocket process
+/**
+ * @brief Run the shared real-sensor path: acquisition, fusion, EKF, and controller.
+ *
+ * The boolean arguments allow diagnostic modes to stop after selected stages.
+ */
 static void Behavior_UpdateRealPipeline(uint32_t now_ms,
                                         bool update_ekf,
                                         bool update_controller)
@@ -1210,14 +1049,17 @@ static void Behavior_UpdateRealPipeline(uint32_t now_ms,
 
     if (update_controller && update_ekf)
     {
-        Behavior_UpdateController(now_ms, dt_s, true);
+        Behavior_UpdateController(dt_s, true);
     }
     else
     {
         telemetry.controller_active = false;
     }
 }
-// push barometer to ekf
+
+/**
+ * @brief Apply the newest unconsumed and non-stale barometer measurement to the EKF.
+ */
 static void Behavior_ConsumeBarometerCorrection(uint32_t now_ms)
 {
     if ((submitted_baro_sequence == consumed_baro_sequence) ||
@@ -1236,8 +1078,11 @@ static void Behavior_ConsumeBarometerCorrection(uint32_t now_ms)
     telemetry.barometer_altitude_valid = true;
     telemetry.barometer_correction_used = true;
 }
-// step controller
-static void Behavior_UpdateController(uint32_t now_ms, float dt_s,
+
+/**
+ * @brief Compute projected apogee and the bounded airbrake deployment request.
+ */
+static void Behavior_UpdateController(float dt_s,
                                       bool allow_deployment)
 {
     ControllerData controller_data;
@@ -1260,6 +1105,7 @@ static void Behavior_UpdateController(uint32_t now_ms, float dt_s,
         telemetry.controller_requested_percent = 0U;
         telemetry.controller_active = false;
         telemetry.controller_output_valid = true;
+        (void)Airbrake_SetTargetPercent(0U);
         return;
     }
 
@@ -1286,11 +1132,11 @@ static void Behavior_UpdateController(uint32_t now_ms, float dt_s,
         (requested >= behavior_config.deployment_min) &&
         (requested <= behavior_config.deployment_max);
 
-    /* Physical command intentionally disabled. */
-    Airbrake_Update(now_ms);
-    Airbrake_SetTargetPercent(telemetry.controller_requested_percent);
+    /* Forward the requested position to the airbrake subsystem. */
+    (void)Airbrake_SetTargetPercent(telemetry.controller_requested_percent);
 }
-// push ekf to telemetry struct
+
+/** @brief Publish current EKF states and validity to telemetry. */
 static void Behavior_CopyEkfTelemetry(void)
 {
     telemetry.ekf_altitude_m =
@@ -1308,7 +1154,10 @@ static void Behavior_CopyEkfTelemetry(void)
         Behavior_Finite(telemetry.ekf_acceleration_m_s2) &&
         Behavior_Finite(telemetry.ekf_bias_m_s2);
 }
-// push fusion to telemetry struct
+
+/**
+ * @brief Publish AHRS orientation, internal status, and positive-up acceleration.
+ */
 static void Behavior_CopyFusionTelemetry(const FusionVector earth_acceleration)
 {
     const FusionEuler euler = FusionQuaternionToEuler(
@@ -1325,8 +1174,16 @@ static void Behavior_CopyFusionTelemetry(const FusionVector earth_acceleration)
     telemetry.fusion_earth_accel_g[1] = earth_acceleration.axis.y;
     telemetry.fusion_earth_accel_g[2] = earth_acceleration.axis.z;
 
-    telemetry.vertical_acceleration_m_s2 =
-        Behavior_EarthVerticalToPositiveUp(earth_acceleration);
+    if (behavior_config.fusion_convention == FusionConventionNed)
+    {
+        telemetry.vertical_acceleration_m_s2 =
+            -earth_acceleration.axis.z * BEHAVIOR_GRAVITY_M_S2;
+    }
+    else
+    {
+        telemetry.vertical_acceleration_m_s2 =
+            earth_acceleration.axis.z * BEHAVIOR_GRAVITY_M_S2;
+    }
 
     telemetry.fusion_acceleration_error_deg = states.accelerationError;
     telemetry.fusion_magnetic_error_deg = states.magneticError;
@@ -1340,7 +1197,281 @@ static void Behavior_CopyFusionTelemetry(const FusionVector earth_acceleration)
         Behavior_Finite(telemetry.fusion_yaw_deg) &&
         Behavior_Finite(telemetry.vertical_acceleration_m_s2);
 }
-// detect flight steps
+
+/* ========================================================================== */
+/* Test operation: mode handlers                                              */
+/* ========================================================================== */
+
+/**
+ * @brief Reset deterministic synthetic-flight truth, metrics, and timing state.
+ */
+static void Behavior_ResetSyntheticTest(uint32_t now_ms,
+                                        bool reset_fusion)
+{
+    if (reset_fusion)
+    {
+        Behavior_ResetFusion();
+    }
+
+    synthetic_time_s = 0.0f;
+    synthetic_previous_velocity_m_s = 0.0f;
+    synthetic_baro_counter = 0U;
+    synthetic_ekf_elapsed_s = 0.0f;
+    synthetic_accel_sum_m_s2 = 0.0f;
+    synthetic_accel_count = 0U;
+    synthetic_truth_quaternion = FUSION_QUATERNION_IDENTITY;
+    last_synthetic_update_ms = now_ms;
+
+    telemetry.flight_phase = BEHAVIOR_FLIGHT_PHASE_PAD;
+    telemetry.test_time_s = 0.0f;
+    telemetry.test_flight_time_s = 0.0f;
+    telemetry.test_true_altitude_m = behavior_config.initial_altitude_agl_m;
+    telemetry.test_true_velocity_m_s = 0.0f;
+    telemetry.test_true_acceleration_m_s2 = 0.0f;
+    telemetry.test_roll_deg = 0.0f;
+    telemetry.test_pitch_deg = 0.0f;
+    telemetry.test_yaw_deg = 0.0f;
+
+    telemetry.fusion_roll_error_deg = 0.0f;
+    telemetry.fusion_pitch_error_deg = 0.0f;
+    telemetry.fusion_yaw_error_deg = 0.0f;
+    telemetry.max_fusion_roll_error_deg = 0.0f;
+    telemetry.max_fusion_pitch_error_deg = 0.0f;
+    telemetry.max_fusion_yaw_error_deg = 0.0f;
+
+    telemetry.altitude_error_m = 0.0f;
+    telemetry.velocity_error_m_s = 0.0f;
+    telemetry.max_altitude_error_m = 0.0f;
+    telemetry.max_velocity_error_m_s = 0.0f;
+
+    telemetry.true_apogee_m = behavior_config.initial_altitude_agl_m;
+    telemetry.estimated_apogee_m = behavior_config.initial_altitude_agl_m;
+    telemetry.true_apogee_error_m = 0.0f;
+    telemetry.apogee_reached = false;
+
+    telemetry.fusion_data_valid = false;
+    telemetry.fusion_within_tolerance = false;
+    telemetry.ekf_data_valid = false;
+    telemetry.ekf_within_altitude_tolerance = false;
+    telemetry.controller_output_valid = false;
+    telemetry.controller_apogee_within_tolerance = false;
+    telemetry.full_pipeline_complete = false;
+    telemetry.full_pipeline_pass = false;
+
+    telemetry.synthetic_samples = 0U;
+    telemetry.full_pipeline_samples = 0U;
+}
+
+/**
+ * @brief Diagnostic mode that verifies synchronized raw sensor acquisition only.
+ */
+static void Behavior_UpdateRawSensorTest(uint32_t now_ms)
+{
+    float dt_s;
+    FusionVector gyroscope;
+    FusionVector accelerometer;
+    FusionVector magnetometer;
+
+    if (!Behavior_ReadAndConvertSensors(now_ms, &dt_s))
+    {
+        return;
+    }
+
+    Behavior_ConvertRawSensors(&gyroscope, &accelerometer, &magnetometer);
+    (void)dt_s;
+
+    telemetry.controller_active = false;
+    telemetry.controller_requested_deployment = 0.0f;
+    telemetry.controller_requested_percent = 0U;
+}
+
+/**
+ * @brief Exercise the altitude EKF and controller with synthetic vertical flight data.
+ */
+static void Behavior_UpdateSyntheticEkfTest(uint32_t now_ms)
+{
+    const uint32_t period_ms = Behavior_GetUpdatePeriodMilliseconds();
+    const float dt_s = Behavior_GetUpdatePeriodSeconds();
+    float measured_acceleration;
+    float synchronized_acceleration;
+
+    if ((uint32_t)(now_ms - last_synthetic_update_ms) < period_ms)
+    {
+        return;
+    }
+
+    last_synthetic_update_ms += period_ms;
+
+    if (telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_LANDED)
+    {
+        return;
+    }
+
+    Behavior_AdvanceSyntheticDynamics(dt_s);
+
+    measured_acceleration = telemetry.test_true_acceleration_m_s2 +
+                            BEHAVIOR_SYNTH_ACCEL_BIAS_M_S2 +
+                            Behavior_Noise(BEHAVIOR_SYNTH_ACCEL_NOISE_M_S2);
+
+    telemetry.vertical_acceleration_m_s2 = measured_acceleration;
+    telemetry.synthetic_samples++;
+    telemetry.fusion_data_valid = false;
+    telemetry.fusion_within_tolerance = false;
+
+    /* The synthetic IMU is faster than the synthetic barometer.  Accumulate
+     * IMU measurements, but do not update the EKF until a new barometer sample
+     * is available so the test follows the same synchronization rule as the
+     * real pipeline.
+     */
+    synthetic_ekf_elapsed_s += dt_s;
+    synthetic_accel_sum_m_s2 += measured_acceleration;
+    synthetic_accel_count++;
+    synthetic_baro_counter++;
+
+    if (synthetic_baro_counter < BEHAVIOR_SYNTHETIC_BARO_DIVIDER)
+    {
+        return;
+    }
+
+    synthetic_baro_counter = 0U;
+    synchronized_acceleration = synthetic_accel_sum_m_s2 /
+                                (float)synthetic_accel_count;
+
+    AltitudeEKF_UpdateImu(&altitude_ekf,
+                          synchronized_acceleration,
+                          synthetic_ekf_elapsed_s);
+    AltitudeEKF_UpdateBaro(
+        &altitude_ekf,
+        telemetry.test_true_altitude_m +
+        Behavior_Noise(BEHAVIOR_SYNTH_BARO_NOISE_M));
+    telemetry.barometer_correction_used = true;
+
+    Behavior_CopyEkfTelemetry();
+    Behavior_UpdateController(synthetic_ekf_elapsed_s,
+        telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_COAST);
+
+    synthetic_ekf_elapsed_s = 0.0f;
+    synthetic_accel_sum_m_s2 = 0.0f;
+    synthetic_accel_count = 0U;
+
+    Behavior_UpdateTestMetrics();
+}
+
+/**
+ * @brief Exercise Fusion AHRS with live sensor data without running the EKF.
+ */
+static void Behavior_UpdateFusionTest(uint32_t now_ms)
+{
+    float dt_s;
+    FusionVector gyroscope;
+    FusionVector accelerometer;
+    FusionVector magnetometer;
+
+    if (!Behavior_ReadAndConvertSensors(now_ms, &dt_s))
+    {
+        return;
+    }
+
+    Behavior_ConvertRawSensors(&gyroscope, &accelerometer, &magnetometer);
+    Behavior_UpdateFusion(gyroscope,
+                          accelerometer,
+                          magnetometer,
+                          latest_magnetometer_valid,
+                          dt_s);
+
+    telemetry.controller_active = false;
+    telemetry.controller_requested_deployment = 0.0f;
+    telemetry.controller_requested_percent = 0U;
+}
+
+/**
+ * @brief Exercise synthetic sensors, AHRS, EKF, controller, and pass/fail metrics.
+ */
+static void Behavior_UpdateFullPipelineTest(uint32_t now_ms)
+{
+    const uint32_t period_ms = Behavior_GetUpdatePeriodMilliseconds();
+    const float dt_s = Behavior_GetUpdatePeriodSeconds();
+    FusionVector body_rate_truth;
+    FusionVector gyroscope;
+    FusionVector accelerometer;
+    FusionVector magnetometer;
+    float synchronized_acceleration;
+
+    if ((uint32_t)(now_ms - last_synthetic_update_ms) < period_ms)
+    {
+        return;
+    }
+
+    last_synthetic_update_ms += period_ms;
+
+    if (telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_LANDED)
+    {
+        return;
+    }
+
+    Behavior_AdvanceSyntheticDynamics(dt_s);
+
+    body_rate_truth = Behavior_GetSyntheticBodyRate();
+    Behavior_UpdateTruthQuaternion(body_rate_truth, dt_s);
+    Behavior_CreateSyntheticSensors(body_rate_truth,
+                                    &gyroscope,
+                                    &accelerometer,
+                                    &magnetometer);
+    Behavior_UpdateSyntheticTruthTelemetry(gyroscope,
+                                           accelerometer,
+                                           magnetometer);
+
+    /* Fusion may run at the faster IMU rate.  Only the EKF is locked to the
+     * slowest sensor, matching the real-sensor pipeline.
+     */
+    Behavior_UpdateFusion(gyroscope,
+                          accelerometer,
+                          magnetometer,
+                          true,
+                          dt_s);
+
+    telemetry.full_pipeline_samples++;
+    synthetic_ekf_elapsed_s += dt_s;
+    synthetic_accel_sum_m_s2 += telemetry.vertical_acceleration_m_s2;
+    synthetic_accel_count++;
+    synthetic_baro_counter++;
+
+    if (synthetic_baro_counter < BEHAVIOR_SYNTHETIC_BARO_DIVIDER)
+    {
+        return;
+    }
+
+    synthetic_baro_counter = 0U;
+    synchronized_acceleration = synthetic_accel_sum_m_s2 /
+                                (float)synthetic_accel_count;
+
+    AltitudeEKF_UpdateImu(&altitude_ekf,
+                          synchronized_acceleration,
+                          synthetic_ekf_elapsed_s);
+    AltitudeEKF_UpdateBaro(
+        &altitude_ekf,
+        telemetry.test_true_altitude_m +
+        Behavior_Noise(BEHAVIOR_SYNTH_BARO_NOISE_M));
+    telemetry.barometer_correction_used = true;
+
+    Behavior_CopyEkfTelemetry();
+    Behavior_UpdateController(synthetic_ekf_elapsed_s,
+        telemetry.flight_phase == BEHAVIOR_FLIGHT_PHASE_COAST);
+
+    synthetic_ekf_elapsed_s = 0.0f;
+    synthetic_accel_sum_m_s2 = 0.0f;
+    synthetic_accel_count = 0U;
+
+    Behavior_UpdateTestMetrics();
+}
+
+/* ========================================================================== */
+/* Test operation: synthetic flight model and evaluation                      */
+/* ========================================================================== */
+
+/**
+ * @brief Advance the deterministic pad, ascent, coast, descent, and landing model.
+ */
 static void Behavior_AdvanceSyntheticDynamics(float dt_s)
 {
     const float flight_start_s = behavior_config.synthetic_pad_warmup_s;
@@ -1426,6 +1557,7 @@ static void Behavior_AdvanceSyntheticDynamics(float dt_s)
     }
 }
 
+/** @brief Return the synthetic rocket body-rate profile in degrees per second. */
 static FusionVector Behavior_GetSyntheticBodyRate(void)
 {
     FusionVector body_rate = FUSION_VECTOR_ZERO;
@@ -1441,6 +1573,9 @@ static FusionVector Behavior_GetSyntheticBodyRate(void)
     return body_rate;
 }
 
+/**
+ * @brief Integrate synthetic body rates into the normalized truth quaternion.
+ */
 static void Behavior_UpdateTruthQuaternion(FusionVector body_rate_dps,
                                            float dt_s)
 {
@@ -1459,7 +1594,10 @@ static void Behavior_UpdateTruthQuaternion(FusionVector body_rate_dps,
     synthetic_truth_quaternion = FusionQuaternionNormalise(
         synthetic_truth_quaternion);
 }
-// sync vectors
+
+/**
+ * @brief Rotate an Earth-frame vector into the synthetic rocket body frame.
+ */
 static FusionVector Behavior_RotateEarthToBody(FusionVector earth_vector,
                                                FusionQuaternion body_to_earth)
 {
@@ -1482,7 +1620,10 @@ static FusionVector Behavior_RotateEarthToBody(FusionVector earth_vector,
 
     return body_vector;
 }
-// simulate sensors
+
+/**
+ * @brief Generate noisy biased gyro, accelerometer, and magnetometer measurements.
+ */
 static void Behavior_CreateSyntheticSensors(FusionVector body_rate_truth,
                                             FusionVector *gyroscope,
                                             FusionVector *accelerometer,
@@ -1552,7 +1693,10 @@ static void Behavior_CreateSyntheticSensors(FusionVector body_rate_truth,
     magnetometer->axis.y += Behavior_Noise(BEHAVIOR_SYNTH_MAG_NOISE);
     magnetometer->axis.z += Behavior_Noise(BEHAVIOR_SYNTH_MAG_NOISE);
 }
-// update telemetry
+
+/**
+ * @brief Publish synthetic truth attitude and generated sensor measurements.
+ */
 static void Behavior_UpdateSyntheticTruthTelemetry(FusionVector gyroscope,
                                                    FusionVector accelerometer,
                                                    FusionVector magnetometer)
@@ -1586,7 +1730,10 @@ static void Behavior_UpdateSyntheticTruthTelemetry(FusionVector gyroscope,
     telemetry.mag[1] = magnetometer.axis.y;
     telemetry.mag[2] = magnetometer.axis.z;
 }
-// verify errors and tolerances
+
+/**
+ * @brief Update estimator/fusion errors, maxima, tolerances, and pipeline result.
+ */
 static void Behavior_UpdateTestMetrics(void)
 {
     float absolute_error;
@@ -1672,7 +1819,10 @@ static void Behavior_UpdateTestMetrics(void)
         telemetry.controller_output_valid &&
         telemetry.controller_apogee_within_tolerance;
 }
-// view results
+
+/**
+ * @brief Evaluate target-apogee accuracy when apogee or landing is detected.
+ */
 static void Behavior_FinalizeApogeeResult(void)
 {
     if (telemetry.apogee_reached)
@@ -1696,11 +1846,17 @@ static void Behavior_FinalizeApogeeResult(void)
         telemetry.controller_apogee_within_tolerance;
 }
 
+/* ========================================================================== */
+/* Shared timing and math helpers                                             */
+/* ========================================================================== */
+
+/** @brief Return the configured estimator period in seconds. */
 static float Behavior_GetUpdatePeriodSeconds(void)
 {
     return 1.0f / behavior_config.estimator_rate_hz;
 }
 
+/** @brief Return the rounded estimator period in milliseconds, never zero. */
 static uint32_t Behavior_GetUpdatePeriodMilliseconds(void)
 {
     uint32_t period_ms = (uint32_t)(1000.0f /
@@ -1709,6 +1865,7 @@ static uint32_t Behavior_GetUpdatePeriodMilliseconds(void)
     return (period_ms == 0U) ? 1U : period_ms;
 }
 
+/** @brief Clamp a floating-point value to an inclusive range. */
 static float Behavior_ClampFloat(float value,
                                  float minimum,
                                  float maximum)
@@ -1726,11 +1883,13 @@ static float Behavior_ClampFloat(float value,
     return value;
 }
 
+/** @brief Return the absolute value of a floating-point number. */
 static float Behavior_Absolute(float value)
 {
     return (value < 0.0f) ? -value : value;
 }
 
+/** @brief Return wrapped estimate-minus-truth angular error in [-180, 180]. */
 static float Behavior_AngleDifferenceDegrees(float estimate,
                                              float truth)
 {
@@ -1749,6 +1908,7 @@ static float Behavior_AngleDifferenceDegrees(float estimate,
     return difference;
 }
 
+/** @brief Return deterministic pseudo-random noise in [-amplitude, amplitude). */
 static float Behavior_Noise(float amplitude)
 {
     int32_t centered;
@@ -1759,17 +1919,8 @@ static float Behavior_Noise(float amplitude)
     return ((float)centered / 32768.0f) * amplitude;
 }
 
+/** @brief Test whether a floating-point value is finite. */
 static bool Behavior_Finite(float value)
 {
     return isfinite(value) != 0;
-}
-
-static float Behavior_EarthVerticalToPositiveUp(FusionVector earth_acceleration)
-{
-    if (behavior_config.fusion_convention == FusionConventionNed)
-    {
-        return -earth_acceleration.axis.z * BEHAVIOR_GRAVITY_M_S2;
-    }
-
-    return earth_acceleration.axis.z * BEHAVIOR_GRAVITY_M_S2;
 }

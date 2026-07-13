@@ -15,6 +15,23 @@
   *
   ******************************************************************************
   */
+
+	/*
+	 * Main is the highest level of abstraction. Handling configuration and subsystem connection.
+	 * the abstraction hierarchy goes like this:
+	 * Main --> Behavior --> rocket_sensors --> sensor drivers -> communication protocol
+	 * 		|			 |--> ekf
+	 * 		|			 |--> controller
+	 * 		|			 |--> airbrake --> motor driver --> communication protocol
+	 * 		|--> Radio_bridge --> radio module --> communication protocol
+	 * 		| <Not implemented below>
+	 * 		|--> Memory organization --> communication protocol
+	 * 		|--> usb communication
+	 *
+	 * AI generated most of the comments and documentation.
+	 * I did the verification though, it should be all clear and easy to understand.
+	 * behavior.c was reformatted greatly though, it was not well organized.
+	 */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -31,14 +48,15 @@
 //#include "lsm6dsv32x.h"
 //#include "lis2mdl.h"
 //#include "bmp388.h"
-#include "tmc5240.h"
+//#include "tmc5240.h"
 #include "airbrake.h"
-#include "controller.h"
+//#include "controller.h"
 //#include "usb_comm.h"
 //#include "altitude_ekf.h"
 //#include "Fusion.h"
 #include "behavior.h"
-#include "openrocket_run_data.h"
+// only for one test
+//#include "openrocket_run_data.h"
 
 
 /* USER CODE END Includes */
@@ -50,7 +68,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define APP_ENABLE_AIRBRAKE_BENCH_OVERRIDE  0U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -141,32 +159,31 @@ int main(void)
   MX_SPI3_Init();
   MX_USBX_Init();
   /* USER CODE BEGIN 2 */
+  // init radio
   if (RadioBridge_Init() != HAL_OK)
   {
       Error_Handler();
   }
-  // init behavior
+  // init behavior (all testing/procedure. Keeps main simple and empty)
   Behavior_DefaultConfig(&g_behavior_config);
 
-  /* Preflight values: edit these directly or through the debugger. */
-  g_behavior_config.target_apogee_m = 100.0f;
-  g_behavior_config.initial_altitude_agl_m = 0.0f;
-  g_behavior_config.launch_site_altitude_msl_m = 0.0f;
+  // Preflight values: edit these directly or through the debugger.
+  g_behavior_config.target_apogee_m = 970.0f; // about 3000 ft.
+  g_behavior_config.initial_altitude_agl_m = 0.0f; // measured from baro
+  g_behavior_config.launch_site_altitude_msl_m = 0.0f; // physical setup
   g_behavior_config.deployment_min = 0.0f;
   g_behavior_config.deployment_max = 1.0f;
-  g_behavior_config.altitude_tolerance_m = 9.144f; /* 30 ft */
+  g_behavior_config.altitude_tolerance_m = 9.144f; // 30 ft
   g_behavior_config.controller_enabled = true;
 
 
-  /*
-   * unsure about board mounting, if it's aligned with rocket axes or not, this will need to change
-   */
+  // set board mounting
   g_behavior_config.imu_alignment = FusionRemapAlignmentPXPYPZ;
   g_behavior_config.mag_alignment = FusionRemapAlignmentPXPYPZ;
 
   if (Behavior_Init(&g_behavior_config, HAL_GetTick()) != HAL_OK)
   {
-      /* Keep running during diagnostics and inspect telemetry.status. */
+      // maybe run an errpor? idk what to put here
   }
 
   g_behavior_telemetry = Behavior_GetTelemetry();
@@ -188,47 +205,39 @@ int main(void)
   airbrake_cfg.amax_normal = 20000;
   airbrake_cfg.vmax_normal = 200000;
 
-	/* timeout */
   airbrake_cfg.move_timeout_ms = 7000U;
 
-	/* For bench testing only */
+  // the airbrake determines if it can deploy
   airbrake_cfg.launch_accel_g = 3.0f;
   airbrake_cfg.burnout_accel_g = 1.5f;
   airbrake_cfg.burnout_drop_g = 2.0f;
-  airbrake_cfg.post_burnout_delay_ms = 1000U;
+  airbrake_cfg.post_burnout_delay_ms = 1000U; // 1 second
 
-  //airbrake_cfg.thermal_limited = false;
-
+  // initialize
   if (Airbrake_Init(&airbrake_cfg) != HAL_OK)
   {
 	Error_Handler();
   }
 
-  Controller cont;
-  Controller_Init(&cont, 970.0f);
-
-    /* For bench testing only: bypass burnout lockout */
-  Airbrake_SetManualOverride(true);
-
-  extern const OpenRocketSample openrocket_run_samples[];
+  // change the define to anything else if you want to be able to control the airbrake outside of burnout detection.
+  Airbrake_SetManualOverride(APP_ENABLE_AIRBRAKE_BENCH_OVERRIDE != 0U);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  ControllerData position;
-  int step = 0;
   while (1)
   {
+	  // basically needed for anything regarding timing
       const uint32_t now_ms = HAL_GetTick();
 
-      /* Apply changed preflight values once. */
+      // change to true in debug menu if you have a new config you want to apply
       if (g_apply_behavior_config)
       {
           g_apply_behavior_config = false;
           (void)Behavior_ApplyConfig(&g_behavior_config, now_ms);
       }
 
-      /* Start the comprehensive Fusion -> EKF -> controller test once. */
+      // was for the comprehensive ekf->motor test, this can be removed if you don't want it
       if (g_request_comprehensive_test)
       {
           g_request_comprehensive_test = false;
@@ -238,24 +247,26 @@ int main(void)
               now_ms);
       }
 
-      /* Return to real-sensor standard behavior once. */
+      // change in debug menu to return to standard mode.
       if (g_request_standard_mode)
       {
           g_request_standard_mode = false;
           Behavior_ReturnToStandard(now_ms);
       }
 
+      // update tick
       Behavior_Update(now_ms);
       // send data
       RadioBridge_Task(g_behavior_telemetry, now_ms);
 
-      float acc = g_behavior_telemetry->ekf_acceleration_m_s2;
-      float alt = g_behavior_telemetry->ekf_altitude_m;
-      float vel = g_behavior_telemetry->ekf_velocity_m_s;
-
-      printf("Acceleration: %f \n", acc);
-      printf("Altitude: %f \n", alt);
-      printf("Velocity: %f \n", vel);
+      // tons of test and debug displays
+//      float acc = g_behavior_telemetry->ekf_acceleration_m_s2;
+//      float alt = g_behavior_telemetry->ekf_altitude_m;
+//      float vel = g_behavior_telemetry->ekf_velocity_m_s;
+//
+//      printf("Acceleration: %f \n", acc);
+//      printf("Altitude: %f \n", alt);
+//      printf("Velocity: %f \n", vel);
 //
 //      RocketSensorRawData_t rawd = g_behavior_telemetry->raw;
 //      printf("imu Raw value x gyro: %f \n", rawd.imu[0]);
@@ -285,34 +296,11 @@ int main(void)
 //      Airbrake_Update(now_ms);
 //      Airbrake_SetTargetPercent((uint8_t) (deploy * 100));
 
-//
+      // delay is needed for tests, but comment out if you
       HAL_Delay(10u);
+      // airbrake actuation happens inside behavior
 
-      /* Physical actuation remains disabled. */
-      // Airbrake_Update(now_ms);
-      // Airbrake_SetTargetPercent(
-      //     g_behavior_telemetry->controller_requested_percent);
-      // TMC5240_EnableDriver();
-
-//	static const uint8_t test_positions[] = {0, 100};
-//	static uint8_t test_index = 0;
-//
-//	Airbrake_Update(HAL_GetTick());
-//
-//	if (!Airbrake_IsBusy())
-//	{
-//		Airbrake_SetTargetPercent(test_positions[test_index]);
-//
-//		test_index++;
-//		if (test_index >= sizeof(test_positions))
-//		{
-//			test_index = 0;
-//		}
-//	}
-//
-//	HAL_Delay(1000U);
-      /* USER CODE END WHILE */
-      /* USER CODE BEGIN 3 */
+      // don't touch anything else, it's auto-generated
 
   }
   /* USER CODE END 3 */

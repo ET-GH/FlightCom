@@ -1,8 +1,8 @@
 /**
- * @file w25q64.c
- * @brief Simple blocking HAL driver for Winbond W25Q64JV SPI NOR flash.
- *
- * Drop into Core/Src.
+ * NOT TESTED AND WAS QUICKLY GENERATED
+ * It mainly was so that I have at least something to work with for the USB
+ * but since USB never worked, I was never able to actually open and work with this.
+ * I didn't want to research the datasheet if I couldn't have the USB working.
  */
 
 #include "w25q64.h"

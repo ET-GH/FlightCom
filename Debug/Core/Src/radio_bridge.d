@@ -38,8 +38,8 @@ Core/Src/radio_bridge.o: ../Core/Src/radio_bridge.c \
  ../Core/Inc/Fusion/FusionAhrs.h ../Core/Inc/Fusion/FusionConvention.h \
  ../Core/Inc/Fusion/FusionMath.h ../Core/Inc/Fusion/FusionBias.h \
  ../Core/Inc/Fusion/FusionCompass.h ../Core/Inc/Fusion/FusionModel.h \
- ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/rocket_protocol.h \
- ../Core/Inc/sx1280.h ../Core/Inc/airbrake.h
+ ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/airbrake.h \
+ ../Core/Inc/rocket_protocol.h ../Core/Inc/sx1280.h
 ../Core/Inc/radio_bridge.h:
 ../Core/Inc/main.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
@@ -88,6 +88,6 @@ Core/Src/radio_bridge.o: ../Core/Src/radio_bridge.c \
 ../Core/Inc/Fusion/FusionCompass.h:
 ../Core/Inc/Fusion/FusionModel.h:
 ../Core/Inc/Fusion/FusionRemap.h:
+../Core/Inc/airbrake.h:
 ../Core/Inc/rocket_protocol.h:
 ../Core/Inc/sx1280.h:
-../Core/Inc/airbrake.h:

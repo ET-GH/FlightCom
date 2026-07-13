@@ -3,6 +3,8 @@
  *   2445 MHz, LoRa SF8, 203.125 kHz BW, CR 4/5,
  *   explicit header, payload CRC, standard IQ, 12-symbol preamble,
  *   +13 dBm requested TX power, and high-sensitivity RX.
+ *
+ *   AI told me that this would get 5000 ft, idk the math myself tho :(
  */
 
 #include "sx1280.h"
@@ -130,6 +132,7 @@ static const SX1280_LoRaConfig sx1280_default_config =
 /* Used by TX and RX after initialization. */
 static SX1280_LoRaConfig sx1280_active_config;
 
+// set the transmission to run, this action should not be interrupted
 static HAL_StatusTypeDef sx1280_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len)
 {
     HAL_StatusTypeDef status;
@@ -151,6 +154,8 @@ static HAL_StatusTypeDef sx1280_transfer(const uint8_t *tx, uint8_t *rx, uint16_
 
     return SX1280_PortWaitBusyLow(100);
 }
+
+// preset sx1280 commands are:
 
 static HAL_StatusTypeDef sx1280_command(uint8_t opcode, const uint8_t *args, uint8_t arg_len)
 {
@@ -212,6 +217,7 @@ static HAL_StatusTypeDef sx1280_read_register(uint16_t address, uint8_t *value)
     return HAL_OK;
 }
 
+// specifically interacting with the tx/rx buffer
 static HAL_StatusTypeDef sx1280_write_buffer(uint8_t offset, const uint8_t *data, uint8_t len)
 {
     uint8_t tx[2 + SX1280_MAX_PAYLOAD_LEN] = {0};
@@ -260,6 +266,7 @@ static HAL_StatusTypeDef sx1280_set_standby(void)
     return sx1280_command(SX1280_CMD_SET_STANDBY, args, sizeof(args));
 }
 
+// we would change this command if we want a different packet type but LoRa works great rn
 static HAL_StatusTypeDef sx1280_set_packet_type_lora(void)
 {
     uint8_t args[1] = {SX1280_PACKET_TYPE_LORA};
@@ -279,6 +286,7 @@ static HAL_StatusTypeDef sx1280_set_rf_frequency(uint32_t freq_hz)
     return sx1280_command(SX1280_CMD_SET_RF_FREQUENCY, args, sizeof(args));
 }
 
+// the tx/rx buffer can be adjusted in size
 static HAL_StatusTypeDef sx1280_set_buffer_base_address(void)
 {
     uint8_t args[2] = {
@@ -381,6 +389,7 @@ static HAL_StatusTypeDef sx1280_set_tx_params(const SX1280_LoRaConfig *config)
     return sx1280_command(SX1280_CMD_SET_TX_PARAMS, args, sizeof(args));
 }
 
+// spreading factor for modulation
 static HAL_StatusTypeDef sx1280_apply_sf_registers(const SX1280_LoRaConfig *config)
 {
     uint8_t sf_register_value;
@@ -413,6 +422,7 @@ static HAL_StatusTypeDef sx1280_apply_sf_registers(const SX1280_LoRaConfig *conf
     return sx1280_write_register(SX1280_REG_FREQ_ERROR_COMP, 0x01);
 }
 
+// far away, it need to be able to detect
 static HAL_StatusTypeDef sx1280_set_high_sensitivity(uint8_t enabled)
 {
     uint8_t rx_gain;
@@ -434,6 +444,7 @@ static HAL_StatusTypeDef sx1280_set_high_sensitivity(uint8_t enabled)
     return sx1280_write_register(SX1280_REG_RX_GAIN, rx_gain);
 }
 
+// interrups aren't used seeing as the entire system needs to work on a cylce, might as well maintaint the cycle.
 static HAL_StatusTypeDef sx1280_set_dio_irq_params(void)
 {
     uint16_t irq_mask =
@@ -497,6 +508,7 @@ static HAL_StatusTypeDef sx1280_get_irq_status(uint16_t *irq_status)
     return HAL_OK;
 }
 
+// is a payload here?
 static HAL_StatusTypeDef sx1280_get_rx_buffer_status(uint8_t *payload_len,
                                                       uint8_t *rx_start_pointer)
 {
@@ -563,6 +575,7 @@ static HAL_StatusTypeDef sx1280_apply_lora_config(const SX1280_LoRaConfig *confi
     return HAL_OK;
 }
 
+// listening
 HAL_StatusTypeDef SX1280_StartRxContinuous(void)
 {
     HAL_StatusTypeDef status;
@@ -585,6 +598,7 @@ HAL_StatusTypeDef SX1280_StartRxContinuous(void)
     return sx1280_command(SX1280_CMD_SET_RX, args, sizeof(args));
 }
 
+// just get the lora talking to the MCU
 HAL_StatusTypeDef SX1280_InitLoRa(void)
 {
     HAL_StatusTypeDef status;
@@ -609,6 +623,7 @@ HAL_StatusTypeDef SX1280_InitLoRa(void)
     return SX1280_StartRxContinuous();
 }
 
+// I send data now, good luck everyone
 HAL_StatusTypeDef SX1280_Transmit(const uint8_t *data, uint8_t len, uint32_t timeout_ms)
 {
     HAL_StatusTypeDef status;
@@ -679,6 +694,7 @@ HAL_StatusTypeDef SX1280_Transmit(const uint8_t *data, uint8_t len, uint32_t tim
     return HAL_TIMEOUT;
 }
 
+// acquire packet and place it into the data
 HAL_StatusTypeDef SX1280_ReadPacketIfAvailable(uint8_t *data, uint8_t *len)
 {
     HAL_StatusTypeDef status;
