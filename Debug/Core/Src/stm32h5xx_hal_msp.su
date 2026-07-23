@@ -1,7 +1,7 @@
 ../Core/Src/stm32h5xx_hal_msp.c:62:6:HAL_MspInit	4	static
-../Core/Src/stm32h5xx_hal_msp.c:82:6:HAL_I2C_MspInit	360	static
-../Core/Src/stm32h5xx_hal_msp.c:212:6:HAL_I2C_MspDeInit	16	static
-../Core/Src/stm32h5xx_hal_msp.c:283:6:HAL_SPI_MspInit	336	static
-../Core/Src/stm32h5xx_hal_msp.c:409:6:HAL_SPI_MspDeInit	16	static
-../Core/Src/stm32h5xx_hal_msp.c:479:6:HAL_PCD_MspInit	288	static
-../Core/Src/stm32h5xx_hal_msp.c:518:6:HAL_PCD_MspDeInit	16	static
+../Core/Src/stm32h5xx_hal_msp.c:82:6:HAL_I2C_MspInit	336	static
+../Core/Src/stm32h5xx_hal_msp.c:202:6:HAL_I2C_MspDeInit	16	static
+../Core/Src/stm32h5xx_hal_msp.c:273:6:HAL_SPI_MspInit	336	static
+../Core/Src/stm32h5xx_hal_msp.c:399:6:HAL_SPI_MspDeInit	16	static
+../Core/Src/stm32h5xx_hal_msp.c:469:6:HAL_PCD_MspInit	288	static
+../Core/Src/stm32h5xx_hal_msp.c:508:6:HAL_PCD_MspDeInit	16	static

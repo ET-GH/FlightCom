@@ -53,7 +53,7 @@
 //#include "tmc5240.h"
 #include "airbrake.h"
 //#include "controller.h"
-//#include "usb_comm.h"
+#include "usb_comm.h"
 //#include "altitude_ekf.h"
 //#include "Fusion.h"
 #include "behavior.h"
@@ -71,6 +71,28 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_ENABLE_AIRBRAKE_BENCH_OVERRIDE  0U
+
+/*
+ * Store one telemetry sample every 250 ms. Event records are inserted
+ * immediately when flags, state, status, or deployment state changes.
+ * With no events, this provides about 12 hours of telemetry capacity.
+ */
+#define MEMORY_LOG_PERIOD_MS                 250U
+
+/*
+ * Archived USB telemetry uses the protocol payload's reserved byte:
+ *   bit 7    = this sample came from flash rather than live telemetry
+ *   bits 0-6 = elapsed time since the previous archived sample, in 10 ms units
+ *
+ * The first archived sample carries a zero delta. The ground station can
+ * reconstruct a flight-relative CSV time column without changing the AMBAR
+ * framing layer or stealing any telemetry measurement field.
+ */
+#define MEMORY_ARCHIVE_FLAG                  0x80U
+#define MEMORY_ARCHIVE_DELTA_MASK            0x7FU
+#define MEMORY_ARCHIVE_DELTA_QUANTUM_MS      10U
+#define MEMORY_ARCHIVE_EVENT_FLAG            0x8000U
+#define MEMORY_ARCHIVE_EVENT_DELTA_MASK      0x7FFFU
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -119,6 +141,49 @@ volatile bool g_measurement_updates_enabled = true;
  *   behavior.c has commanded the safe fully retracted 0% position.
  */
 volatile bool g_airbrakes_enabled = true;
+
+/* ------------------------------------------------------------------------- */
+/* External W25Q64JV flash and Rocket Protocol archive diagnostics            */
+/* ------------------------------------------------------------------------- */
+
+static W25Q64_HandleTypeDef g_memory_flash;
+
+/* These variables are intentionally visible to Live Expressions/debugger. */
+volatile W25Q64_Result_t g_memory_flash_init_result = W25Q64_ERROR;
+volatile W25Q64_Result_t g_memory_log_result = W25Q64_ERROR;
+volatile uint32_t g_memory_log_records = 0U;
+volatile uint32_t g_memory_log_capacity = 0U;
+volatile uint32_t g_memory_log_corrupt_records = 0U;
+volatile uint32_t g_memory_log_write_failures = 0U;
+volatile uint32_t g_memory_exported_records = 0U;
+volatile uint32_t g_memory_export_read_failures = 0U;
+volatile bool g_memory_export_active = false;
+
+/*
+ * Set true in the debugger to erase the archive. The request is accepted only
+ * while measurement updates are suspended and no USB export is active because
+ * erasing all 2047 log sectors is intentionally blocking and can take a long
+ * time. The flag stays true until those safety conditions are met.
+ */
+volatile bool g_request_memory_log_erase = false;
+
+static uint32_t g_memory_last_log_ms = 0U;
+static bool g_memory_usb_was_connected = false;
+static bool g_memory_export_record_loaded = false;
+static uint32_t g_memory_export_index = 0U;
+static uint32_t g_memory_export_total = 0U;
+static uint32_t g_memory_export_record_time_ms = 0U;
+static uint32_t g_memory_export_previous_time_ms = 0U;
+static uint8_t g_memory_export_packet_type = ROCKET_PKT_TELEMETRY;
+static RocketTelemetryPayload g_memory_export_payload;
+static RocketEventPayload g_memory_export_event;
+
+/* Previous archived state used to create event records at their exact time. */
+static bool g_memory_event_state_valid = false;
+static uint16_t g_memory_previous_flags = 0U;
+static uint8_t g_memory_previous_state = 0U;
+static uint8_t g_memory_previous_status = ROCKET_STATUS_UNKNOWN;
+static uint8_t g_memory_previous_deployment_percent = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -146,10 +211,596 @@ uint8_t RadioBridge_ExecuteCommand(uint8_t command,
                                    uint32_t *detail);
 
 void MX_USB_PCD_Init(void);
+
+/*
+ * High-level log API implemented at the end of w25q64.c. Keeping these
+ * declarations local lets this integration replace only main.c and w25q64.c.
+ * They can be moved into w25q64.h later without changing the implementation.
+ */
+W25Q64_Result_t W25Q64_LogOpen(W25Q64_HandleTypeDef *dev);
+W25Q64_Result_t W25Q64_LogAppend(
+    W25Q64_HandleTypeDef *dev,
+    uint32_t time_ms,
+    const RocketTelemetryPayload *payload);
+W25Q64_Result_t W25Q64_LogAppendEvent(
+    W25Q64_HandleTypeDef *dev,
+    uint32_t time_ms,
+    const RocketEventPayload *payload);
+W25Q64_Result_t W25Q64_LogReadRecord(
+    W25Q64_HandleTypeDef *dev,
+    uint32_t record_index,
+    uint32_t *time_ms,
+    uint8_t *packet_type,
+    RocketTelemetryPayload *telemetry,
+    RocketEventPayload *event);
+W25Q64_Result_t W25Q64_LogErase(W25Q64_HandleTypeDef *dev);
+uint32_t W25Q64_LogGetCount(void);
+uint32_t W25Q64_LogGetCapacity(void);
+uint32_t W25Q64_LogGetCorruptCount(void);
+bool W25Q64_LogCanAppend(void);
+
+static void Memory_LogTask(
+    const volatile BehaviorTelemetry_t *telemetry,
+    uint32_t now_ms,
+    bool behavior_updated);
+static void Memory_ExportTask(void);
+static void Memory_ServiceEraseRequest(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* ========================================================================== */
+/* External flash logging and USB replay                                      */
+/* ========================================================================== */
+
+static int16_t Memory_ClampI16(float value)
+{
+    if (!isfinite(value))
+    {
+        return 0;
+    }
+    if (value > 32767.0f)
+    {
+        return 32767;
+    }
+    if (value < -32768.0f)
+    {
+        return -32768;
+    }
+    return (int16_t)lroundf(value);
+}
+
+static uint16_t Memory_ClampU16(float value)
+{
+    if (!isfinite(value) || (value <= 0.0f))
+    {
+        return 0U;
+    }
+    if (value > 65535.0f)
+    {
+        return 65535U;
+    }
+    return (uint16_t)lroundf(value);
+}
+
+static bool Memory_SensorStatusIsFault(HAL_StatusTypeDef status)
+{
+    return (status != HAL_OK) && (status != HAL_BUSY);
+}
+
+static uint16_t Memory_MakeFlags(
+    const volatile BehaviorTelemetry_t *telemetry)
+{
+    uint16_t flags = 0U;
+
+    if (telemetry->initialized)
+    {
+        flags |= ROCKET_FLAG_INITIALIZED;
+    }
+    if (telemetry->barometer_altitude_valid)
+    {
+        flags |= ROCKET_FLAG_BARO_VALID;
+    }
+    if (telemetry->fusion_data_valid)
+    {
+        flags |= ROCKET_FLAG_FUSION_VALID;
+    }
+    if (telemetry->ekf_data_valid)
+    {
+        flags |= ROCKET_FLAG_EKF_VALID;
+    }
+    if (telemetry->controller_enabled)
+    {
+        flags |= ROCKET_FLAG_CONTROLLER_ENABLED;
+    }
+    if (telemetry->controller_active)
+    {
+        flags |= ROCKET_FLAG_CONTROLLER_ACTIVE;
+    }
+    if (telemetry->apogee_reached)
+    {
+        flags |= ROCKET_FLAG_APOGEE_REACHED;
+    }
+    if (telemetry->mode_changed)
+    {
+        flags |= ROCKET_FLAG_MODE_CHANGED;
+    }
+    if (telemetry->barometer_correction_used)
+    {
+        flags |= ROCKET_FLAG_BARO_CORRECTION_USED;
+    }
+    if (telemetry->fusion_startup)
+    {
+        flags |= ROCKET_FLAG_FUSION_STARTUP;
+    }
+    if (telemetry->fusion_accelerometer_ignored)
+    {
+        flags |= ROCKET_FLAG_ACCEL_IGNORED;
+    }
+    if (telemetry->fusion_magnetometer_ignored)
+    {
+        flags |= ROCKET_FLAG_MAG_IGNORED;
+    }
+    if (telemetry->full_pipeline_complete)
+    {
+        flags |= ROCKET_FLAG_PIPELINE_COMPLETE;
+    }
+    if (telemetry->full_pipeline_pass)
+    {
+        flags |= ROCKET_FLAG_PIPELINE_PASS;
+    }
+
+    if (Memory_SensorStatusIsFault(telemetry->imu_status) ||
+        Memory_SensorStatusIsFault(telemetry->mag_status) ||
+        Memory_SensorStatusIsFault(telemetry->baro_status))
+    {
+        flags |= ROCKET_FLAG_SENSOR_FAULT;
+    }
+
+    return flags;
+}
+
+static uint8_t Memory_MakeState(
+    const volatile BehaviorTelemetry_t *telemetry)
+{
+    return (uint8_t)((((uint8_t)telemetry->mode & 0x0FU) << 4) |
+                     ((uint8_t)telemetry->flight_phase & 0x0FU));
+}
+
+static uint8_t Memory_MakeSensorHealth(
+    const volatile BehaviorTelemetry_t *telemetry)
+{
+    const uint8_t imu_health =
+        Memory_SensorStatusIsFault(telemetry->imu_status)
+            ? ROCKET_SENSOR_FAULT
+            : ROCKET_SENSOR_OK;
+    const uint8_t mag_health =
+        Memory_SensorStatusIsFault(telemetry->mag_status)
+            ? ROCKET_SENSOR_FAULT
+            : ROCKET_SENSOR_OK;
+    const uint8_t baro_health =
+        Memory_SensorStatusIsFault(telemetry->baro_status)
+            ? ROCKET_SENSOR_FAULT
+            : ROCKET_SENSOR_OK;
+
+    return (uint8_t)(imu_health |
+                     (uint8_t)(mag_health << 2) |
+                     (uint8_t)(baro_health << 4));
+}
+
+static uint8_t Memory_MapStatus(uint32_t status)
+{
+    switch (status)
+    {
+        case BEHAVIOR_STATUS_OK:
+            return ROCKET_STATUS_OK;
+        case BEHAVIOR_STATUS_SENSOR_INIT_FAILED:
+            return ROCKET_STATUS_SENSOR_INIT_FAILED;
+        case BEHAVIOR_STATUS_SENSOR_READ_FAILED:
+            return ROCKET_STATUS_SENSOR_READ_FAILED;
+        case BEHAVIOR_STATUS_UNSUPPORTED_MODE:
+            return ROCKET_STATUS_UNSUPPORTED_MODE;
+        case BEHAVIOR_STATUS_BAD_ARGUMENT:
+            return ROCKET_STATUS_BAD_ARGUMENT;
+        case BEHAVIOR_STATUS_INVALID_CONFIG:
+            return ROCKET_STATUS_INVALID_CONFIG;
+        default:
+            return ROCKET_STATUS_UNKNOWN;
+    }
+}
+
+static bool Memory_BuildRocketTelemetry(
+    const volatile BehaviorTelemetry_t *telemetry,
+    RocketTelemetryPayload *payload)
+{
+    uint32_t failed_reads;
+
+    if ((telemetry == NULL) || (payload == NULL))
+    {
+        return false;
+    }
+
+    failed_reads = telemetry->failed_reads;
+    if (failed_reads > 65535U)
+    {
+        failed_reads = 65535U;
+    }
+
+    memset(payload, 0, sizeof(*payload));
+    payload->flags = Memory_MakeFlags(telemetry);
+    payload->state = Memory_MakeState(telemetry);
+    payload->status_code = Memory_MapStatus((uint32_t)telemetry->status);
+    payload->altitude_dm =
+        Memory_ClampI16(telemetry->ekf_altitude_m * 10.0f);
+    payload->velocity_cms =
+        Memory_ClampI16(telemetry->ekf_velocity_m_s * 100.0f);
+    payload->acceleration_cms2 =
+        Memory_ClampI16(telemetry->ekf_acceleration_m_s2 * 100.0f);
+    payload->predicted_apogee_dm =
+        Memory_ClampU16(telemetry->predicted_apogee_m * 10.0f);
+    payload->target_apogee_dm =
+        Memory_ClampU16(telemetry->target_apogee_m * 10.0f);
+    payload->roll_ddeg =
+        Memory_ClampI16(telemetry->fusion_roll_deg * 10.0f);
+    payload->pitch_ddeg =
+        Memory_ClampI16(telemetry->fusion_pitch_deg * 10.0f);
+    payload->yaw_ddeg =
+        Memory_ClampI16(telemetry->fusion_yaw_deg * 10.0f);
+    payload->deployment_percent =
+        telemetry->controller_requested_percent;
+    payload->sensor_health = Memory_MakeSensorHealth(telemetry);
+    payload->failed_reads = (uint16_t)failed_reads;
+    payload->message_code = ROCKET_MSG_NONE;
+    payload->reserved = 0U;
+
+    return true;
+}
+
+static uint8_t Memory_SelectEventMessage(
+    bool previous_valid,
+    uint16_t previous_flags,
+    uint16_t current_flags,
+    uint8_t previous_state,
+    uint8_t current_state,
+    uint8_t previous_deployment,
+    uint8_t current_deployment)
+{
+    const uint8_t previous_phase = previous_state & 0x0FU;
+    const uint8_t current_phase = current_state & 0x0FU;
+
+    if (!previous_valid)
+    {
+        return ROCKET_MSG_BOOT;
+    }
+
+    if (previous_phase != current_phase)
+    {
+        switch (current_phase)
+        {
+            case BEHAVIOR_FLIGHT_PHASE_POWERED_ASCENT:
+                return ROCKET_MSG_LAUNCH_DETECTED;
+            case BEHAVIOR_FLIGHT_PHASE_COAST:
+                return ROCKET_MSG_BURNOUT_DETECTED;
+            case BEHAVIOR_FLIGHT_PHASE_DESCENT:
+                return ROCKET_MSG_APOGEE_REACHED;
+            case BEHAVIOR_FLIGHT_PHASE_LANDED:
+                return ROCKET_MSG_LANDING_DETECTED;
+            default:
+                break;
+        }
+    }
+
+    if (((previous_flags ^ current_flags) &
+         ROCKET_FLAG_CONTROLLER_ENABLED) != 0U)
+    {
+        return ((current_flags & ROCKET_FLAG_CONTROLLER_ENABLED) != 0U)
+            ? ROCKET_MSG_CONTROLLER_ENABLED
+            : ROCKET_MSG_CONTROLLER_DISABLED;
+    }
+
+    if ((previous_deployment == 0U) && (current_deployment != 0U))
+    {
+        return ROCKET_MSG_AIRBRAKE_DEPLOYED;
+    }
+
+    if ((previous_deployment != 0U) && (current_deployment == 0U))
+    {
+        return ROCKET_MSG_AIRBRAKE_RETRACTED;
+    }
+
+    if ((previous_state & 0xF0U) != (current_state & 0xF0U))
+    {
+        return ROCKET_MSG_MODE_CHANGED;
+    }
+
+    return ROCKET_MSG_NONE;
+}
+
+static void Memory_RocketToUsbTelemetry(
+    const RocketTelemetryPayload *rocket,
+    AmbarHilUsbTelemetry *usb)
+{
+    memset(usb, 0, sizeof(*usb));
+    usb->flags = rocket->flags;
+    usb->state = rocket->state;
+    usb->status_code = rocket->status_code;
+    usb->altitude_dm = rocket->altitude_dm;
+    usb->velocity_cms = rocket->velocity_cms;
+    usb->acceleration_cms2 = rocket->acceleration_cms2;
+    usb->predicted_apogee_dm = rocket->predicted_apogee_dm;
+    usb->target_apogee_dm = rocket->target_apogee_dm;
+    usb->roll_ddeg = rocket->roll_ddeg;
+    usb->pitch_ddeg = rocket->pitch_ddeg;
+    usb->yaw_ddeg = rocket->yaw_ddeg;
+    usb->deployment_percent = rocket->deployment_percent;
+    usb->sensor_health = rocket->sensor_health;
+    usb->failed_reads = rocket->failed_reads;
+    usb->message_code = rocket->message_code;
+    usb->reserved = rocket->reserved;
+}
+
+static void Memory_RocketToUsbEvent(
+    const RocketEventPayload *rocket,
+    AmbarHilUsbEvent *usb)
+{
+    memset(usb, 0, sizeof(*usb));
+    usb->changed_flags = rocket->changed_flags;
+    usb->current_flags = rocket->current_flags;
+    usb->previous_state = rocket->previous_state;
+    usb->current_state = rocket->current_state;
+    usb->status_code = rocket->status_code;
+    usb->message_code = rocket->message_code;
+    usb->detail = rocket->detail;
+}
+
+/**
+ * Detect events every behavior iteration and store telemetry every 250 ms.
+ * Event timestamps therefore are not rounded to the telemetry interval.
+ */
+static void Memory_LogTask(
+    const volatile BehaviorTelemetry_t *telemetry,
+    uint32_t now_ms,
+    bool behavior_updated)
+{
+    RocketTelemetryPayload sample;
+    const bool ready =
+        behavior_updated &&
+        (telemetry != NULL) &&
+        (g_memory_flash_init_result == W25Q64_OK) &&
+        W25Q64_LogCanAppend() &&
+        !USBComm_IsConnected();
+
+    if (!ready || !Memory_BuildRocketTelemetry(telemetry, &sample))
+    {
+        return;
+    }
+
+    {
+        const bool deployment_boundary_changed =
+            g_memory_event_state_valid &&
+            ((g_memory_previous_deployment_percent == 0U) !=
+             (sample.deployment_percent == 0U));
+        const bool event_needed =
+            !g_memory_event_state_valid ||
+            (sample.flags != g_memory_previous_flags) ||
+            (sample.state != g_memory_previous_state) ||
+            (sample.status_code != g_memory_previous_status) ||
+            deployment_boundary_changed;
+
+        if (event_needed)
+        {
+            RocketEventPayload event;
+
+            memset(&event, 0, sizeof(event));
+            event.changed_flags = g_memory_event_state_valid
+                ? (uint16_t)(sample.flags ^ g_memory_previous_flags)
+                : sample.flags;
+            event.current_flags = sample.flags;
+            event.previous_state = g_memory_event_state_valid
+                ? g_memory_previous_state
+                : sample.state;
+            event.current_state = sample.state;
+            event.status_code = sample.status_code;
+            event.message_code = Memory_SelectEventMessage(
+                g_memory_event_state_valid,
+                g_memory_previous_flags,
+                sample.flags,
+                event.previous_state,
+                event.current_state,
+                g_memory_previous_deployment_percent,
+                sample.deployment_percent);
+            event.detail = 0U;
+
+            g_memory_log_result =
+                W25Q64_LogAppendEvent(&g_memory_flash,
+                                      now_ms,
+                                      &event);
+
+            if (g_memory_log_result != W25Q64_OK)
+            {
+                ++g_memory_log_write_failures;
+                return;
+            }
+
+            g_memory_previous_flags = sample.flags;
+            g_memory_previous_state = sample.state;
+            g_memory_previous_status = sample.status_code;
+            g_memory_previous_deployment_percent =
+                sample.deployment_percent;
+            g_memory_event_state_valid = true;
+        }
+    }
+
+    if ((uint32_t)(now_ms - g_memory_last_log_ms) < MEMORY_LOG_PERIOD_MS)
+    {
+        g_memory_log_records = W25Q64_LogGetCount();
+        return;
+    }
+
+    g_memory_last_log_ms = now_ms;
+    g_memory_log_result =
+        W25Q64_LogAppend(&g_memory_flash, now_ms, &sample);
+
+    if (g_memory_log_result != W25Q64_OK)
+    {
+        ++g_memory_log_write_failures;
+    }
+
+    g_memory_log_records = W25Q64_LogGetCount();
+    g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
+}
+
+/**
+ * Replay telemetry and event records once per physical USB connection.
+ *
+ * Telemetry uses reserved bit 7 plus a 10 ms delta, as before. Archived events
+ * use detail bit 15 plus a 10 ms delta. The generated flash events currently
+ * store detail=0, so no event information is lost by this USB convention.
+ */
+static void Memory_ExportTask(void)
+{
+    const bool connected = USBComm_IsConnected();
+
+    if (!connected)
+    {
+        g_memory_usb_was_connected = false;
+        g_memory_export_active = false;
+        g_memory_export_record_loaded = false;
+        return;
+    }
+
+    if (!g_memory_usb_was_connected)
+    {
+        g_memory_usb_was_connected = true;
+        g_memory_export_index = 0U;
+        g_memory_export_total = W25Q64_LogGetCount();
+        g_memory_export_previous_time_ms = 0U;
+        g_memory_exported_records = 0U;
+        g_memory_export_record_loaded = false;
+        g_memory_export_active =
+            (g_memory_flash_init_result == W25Q64_OK) &&
+            (g_memory_export_total != 0U);
+    }
+
+    if (!g_memory_export_active)
+    {
+        return;
+    }
+
+    if (!g_memory_export_record_loaded)
+    {
+        g_memory_log_result =
+            W25Q64_LogReadRecord(&g_memory_flash,
+                                 g_memory_export_index,
+                                 &g_memory_export_record_time_ms,
+                                 &g_memory_export_packet_type,
+                                 &g_memory_export_payload,
+                                 &g_memory_export_event);
+
+        if (g_memory_log_result != W25Q64_OK)
+        {
+            ++g_memory_export_read_failures;
+            g_memory_export_active = false;
+            g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
+            return;
+        }
+
+        g_memory_export_record_loaded = true;
+    }
+
+    {
+        uint32_t delta_ms = 0U;
+        uint32_t delta_units = 0U;
+        bool queued = false;
+
+        if (g_memory_export_index != 0U)
+        {
+            delta_ms =
+                g_memory_export_record_time_ms -
+                g_memory_export_previous_time_ms;
+            delta_units =
+                (delta_ms + (MEMORY_ARCHIVE_DELTA_QUANTUM_MS / 2U)) /
+                MEMORY_ARCHIVE_DELTA_QUANTUM_MS;
+        }
+
+        if (g_memory_export_packet_type == ROCKET_PKT_TELEMETRY)
+        {
+            AmbarHilUsbTelemetry usb_payload;
+
+            Memory_RocketToUsbTelemetry(&g_memory_export_payload,
+                                        &usb_payload);
+
+            if (delta_units > MEMORY_ARCHIVE_DELTA_MASK)
+            {
+                delta_units = MEMORY_ARCHIVE_DELTA_MASK;
+            }
+
+            usb_payload.reserved =
+                (uint8_t)(MEMORY_ARCHIVE_FLAG |
+                          (uint8_t)delta_units);
+            queued = USBComm_SendTelemetry(&usb_payload);
+        }
+        else if (g_memory_export_packet_type == ROCKET_PKT_EVENT)
+        {
+            AmbarHilUsbEvent usb_event;
+
+            Memory_RocketToUsbEvent(&g_memory_export_event,
+                                    &usb_event);
+
+            if (delta_units > MEMORY_ARCHIVE_EVENT_DELTA_MASK)
+            {
+                delta_units = MEMORY_ARCHIVE_EVENT_DELTA_MASK;
+            }
+
+            usb_event.detail =
+                (uint16_t)(MEMORY_ARCHIVE_EVENT_FLAG |
+                           (uint16_t)delta_units);
+            queued = USBComm_SendEvent(&usb_event);
+        }
+        else
+        {
+            ++g_memory_export_read_failures;
+            g_memory_export_active = false;
+            return;
+        }
+
+        if (queued)
+        {
+            g_memory_export_previous_time_ms =
+                g_memory_export_record_time_ms;
+            ++g_memory_export_index;
+            ++g_memory_exported_records;
+            g_memory_export_record_loaded = false;
+
+            if (g_memory_export_index >= g_memory_export_total)
+            {
+                g_memory_export_active = false;
+            }
+        }
+    }
+}
+
+
+/** Execute the intentionally blocking erase only in a safe, suspended state. */
+static void Memory_ServiceEraseRequest(void)
+{
+    if (!g_request_memory_log_erase ||
+        g_measurement_updates_enabled ||
+        g_memory_export_active ||
+        (g_memory_flash_init_result != W25Q64_OK))
+    {
+        return;
+    }
+
+    g_request_memory_log_erase = false;
+    g_memory_log_result = W25Q64_LogErase(&g_memory_flash);
+    g_memory_log_records = W25Q64_LogGetCount();
+    g_memory_log_capacity = W25Q64_LogGetCapacity();
+    g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
+    g_memory_event_state_valid = false;
+    g_memory_last_log_ms = HAL_GetTick();
+}
 
 /**
  * @brief Execute one validated command extracted by radio_bridge.c.
@@ -795,12 +1446,40 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /*
+   * Initialize the AMBAR-to-CDC adapter before allowing the host
+   * to activate the CDC interface.
+   */
+  if (!USBComm_Init())
+  {
+      Error_Handler();
+  }
+
+  /*
    * Connect the device electrically to the USB host.
    */
   if (HAL_PCD_Start(&hpcd_USB_DRD_FS) != HAL_OK)
   {
       Error_Handler();
   }
+
+  /*
+     * SPI3 and GPIOD pin 2 are the fitted W25Q64JV interface. A storage failure
+     * is recorded for diagnostics but does not stop estimator, radio, USB, or
+     * airbrake operation; flight safety must not depend on the logger.
+     */
+    W25Q64_Attach(&g_memory_flash,
+                  &hspi3,
+                  SPI3_CS_GPIO_Port,
+                  SPI3_CS_Pin);
+
+    g_memory_flash_init_result = W25Q64_Init(&g_memory_flash);
+    if (g_memory_flash_init_result == W25Q64_OK)
+    {
+        g_memory_log_result = W25Q64_LogOpen(&g_memory_flash);
+        g_memory_log_records = W25Q64_LogGetCount();
+        g_memory_log_capacity = W25Q64_LogGetCapacity();
+        g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
+    }
 
   // init radio
   if (RadioBridge_Init() != HAL_OK)
@@ -933,6 +1612,12 @@ int main(void)
 		/* Command interpretation and acknowledgements are never suspended. */
 		RadioBridge_Task(g_behavior_telemetry, now_ms);
 
+		/* Archive the stable Rocket Protocol payload, not compiler-dependent RAM. */
+		Memory_LogTask(g_behavior_telemetry, now_ms, behavior_updated);
+
+		/* A requested full erase waits here until measurement updates are stopped. */
+		Memory_ServiceEraseRequest();
+
 		// tons of test and debug displays
   //      float acc = g_behavior_telemetry->ekf_acceleration_m_s2;
   //      float alt = g_behavior_telemetry->ekf_altitude_m;
@@ -981,6 +1666,13 @@ int main(void)
 		 * CDC transfers, and USBX class processing can progress.
 		 */
 		ux_system_tasks_run();
+		/*
+		 * CDC transfers, AMBAR decoding, and PING ACK generation.
+		 */
+		USBComm_Task();
+
+		/* On each new physical connection, replay the complete archive once. */
+		Memory_ExportTask();
 
 		// don't touch anything else, it's auto-generated
     /* USER CODE END WHILE */

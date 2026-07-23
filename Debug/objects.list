@@ -22,6 +22,7 @@
 "./Core/Src/sysmem.o"
 "./Core/Src/system_stm32h5xx.o"
 "./Core/Src/tmc5240.o"
+"./Core/Src/usb_comm.o"
 "./Core/Src/w25q64.o"
 "./Core/Startup/startup_stm32h562rgtx.o"
 "./Drivers/STM32H5xx_HAL_Driver/Src/stm32h5xx_hal.o"
