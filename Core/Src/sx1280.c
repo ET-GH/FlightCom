@@ -132,6 +132,19 @@ static const SX1280_LoRaConfig sx1280_default_config =
 /* Used by TX and RX after initialization. */
 static SX1280_LoRaConfig sx1280_active_config;
 
+/*
+ * Shared synchronous SPI transaction buffers.
+ *
+ * These are stored in static RAM instead of the call stack. The current radio
+ * driver is synchronous and does not perform SPI transactions from an ISR, so
+ * one shared pair is sufficient.
+ */
+static uint8_t sx1280_spi_tx_buffer[
+    3U + SX1280_MAX_PAYLOAD_LEN];
+
+static uint8_t sx1280_spi_rx_buffer[
+    3U + SX1280_MAX_PAYLOAD_LEN];
+
 // set the transmission to run, this action should not be interrupted
 static HAL_StatusTypeDef sx1280_transfer(const uint8_t *tx, uint8_t *rx, uint16_t len)
 {
@@ -218,45 +231,92 @@ static HAL_StatusTypeDef sx1280_read_register(uint16_t address, uint8_t *value)
 }
 
 // specifically interacting with the tx/rx buffer
-static HAL_StatusTypeDef sx1280_write_buffer(uint8_t offset, const uint8_t *data, uint8_t len)
+static HAL_StatusTypeDef sx1280_write_buffer(
+    uint8_t offset,
+    const uint8_t *data,
+    uint8_t len)
 {
-    uint8_t tx[2 + SX1280_MAX_PAYLOAD_LEN] = {0};
-    uint8_t rx[2 + SX1280_MAX_PAYLOAD_LEN] = {0};
+    const uint16_t transfer_length =
+        (uint16_t)len + 2U;
 
-    if ((data == 0) || (len == 0))
+    if ((data == NULL) ||
+        (len == 0U) ||
+        (len > SX1280_MAX_PAYLOAD_LEN))
     {
         return HAL_ERROR;
     }
 
-    tx[0] = SX1280_CMD_WRITE_BUFFER;
-    tx[1] = offset;
-    memcpy(&tx[2], data, len);
+    /*
+     * Clear only the part used for this SPI transaction.
+     */
+    memset(sx1280_spi_tx_buffer,
+           0,
+           transfer_length);
 
-    return sx1280_transfer(tx, rx, (uint16_t)(len + 2));
+    memset(sx1280_spi_rx_buffer,
+           0,
+           transfer_length);
+
+    sx1280_spi_tx_buffer[0] =
+        SX1280_CMD_WRITE_BUFFER;
+
+    sx1280_spi_tx_buffer[1] = offset;
+
+    memcpy(&sx1280_spi_tx_buffer[2],
+           data,
+           len);
+
+    return sx1280_transfer(
+        sx1280_spi_tx_buffer,
+        sx1280_spi_rx_buffer,
+        transfer_length);
 }
 
-static HAL_StatusTypeDef sx1280_read_buffer(uint8_t offset, uint8_t *data, uint8_t len)
+static HAL_StatusTypeDef sx1280_read_buffer(
+    uint8_t offset,
+    uint8_t *data,
+    uint8_t len)
 {
-    uint8_t tx[3 + SX1280_MAX_PAYLOAD_LEN] = {0};
-    uint8_t rx[3 + SX1280_MAX_PAYLOAD_LEN] = {0};
+    const uint16_t transfer_length =
+        (uint16_t)len + 3U;
+
     HAL_StatusTypeDef status;
 
-    if (data == 0)
+    if ((data == NULL) ||
+        (len == 0U) ||
+        (len > SX1280_MAX_PAYLOAD_LEN))
     {
         return HAL_ERROR;
     }
 
-    tx[0] = SX1280_CMD_READ_BUFFER;
-    tx[1] = offset;
-    tx[2] = 0x00;
+    memset(sx1280_spi_tx_buffer,
+           0,
+           transfer_length);
 
-    status = sx1280_transfer(tx, rx, (uint16_t)(len + 3));
+    memset(sx1280_spi_rx_buffer,
+           0,
+           transfer_length);
+
+    sx1280_spi_tx_buffer[0] =
+        SX1280_CMD_READ_BUFFER;
+
+    sx1280_spi_tx_buffer[1] = offset;
+    sx1280_spi_tx_buffer[2] = 0x00U;
+
+    status = sx1280_transfer(
+        sx1280_spi_tx_buffer,
+        sx1280_spi_rx_buffer,
+        transfer_length);
+
     if (status != HAL_OK)
     {
         return status;
     }
 
-    memcpy(data, &rx[3], len);
+    memcpy(data,
+           &sx1280_spi_rx_buffer[3],
+           len);
+
     return HAL_OK;
 }
 

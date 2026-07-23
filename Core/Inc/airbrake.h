@@ -95,6 +95,21 @@ void Airbrake_EStop(void);
 Airbrake_Telemetry_t Airbrake_GetTelemetry(void);
 bool Airbrake_IsBusy(void);
 
+/*
+ * Relative motor-step ownership.
+ *
+ * Positive steps move physically toward deployment.
+ * Negative steps move physically toward retraction.
+ */
+HAL_StatusTypeDef Airbrake_MoveRelativeSteps(int16_t steps);
+bool Airbrake_IsManualStepActive(void);
+
+/*
+ * Clear recoverable actuator and TMC5240 fault latches without resetting
+ * calibration, position, flight state, controller state, or configuration.
+ */
+HAL_StatusTypeDef Airbrake_ClearFaults(void);
+
 #ifdef __cplusplus
 }
 #endif

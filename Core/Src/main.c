@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "radio_bridge.h"
+#include "rocket_protocol.h"
 //#include "rocket_sensors.h"
 //#include "lsm6dsv32x.h"
 //#include "lis2mdl.h"
@@ -97,6 +98,27 @@ volatile const BehaviorTelemetry_t *g_behavior_telemetry = NULL;
 volatile bool g_request_comprehensive_test = false;
 volatile bool g_request_standard_mode = false;
 volatile bool g_apply_behavior_config = false;
+
+/*
+ * Command-controlled application gates.
+ *
+ * The radio bridge always keeps command interpretation alive. Main uses these
+ * gates to implement the requested standby and flight-computer semantics
+ * without moving application policy into the packet parser.
+ */
+volatile bool g_flight_computer_enabled = true;
+volatile bool g_measurement_updates_enabled = true;
+/*
+ * Protocol-level airbrake enable state.
+ *
+ * true:
+ *   Automatic or manually requested airbrake operation is available.
+ *
+ * false:
+ *   Automatic control is disabled, new relative movements are blocked, and
+ *   behavior.c has commanded the safe fully retracted 0% position.
+ */
+volatile bool g_airbrakes_enabled = true;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,10 +134,620 @@ static void MX_SPI2_Init(void);
 static void MX_SPI3_Init(void);
 /* USER CODE BEGIN PFP */
 
+/*
+ * Strong implementation of the weak command callback in radio_bridge.c.
+ * The bridge has already validated command length and value ranges before this
+ * function is called.
+ */
+uint8_t RadioBridge_ExecuteCommand(uint8_t command,
+                                   const uint8_t *payload,
+                                   uint8_t payload_length,
+                                   uint32_t now_ms,
+                                   uint32_t *detail);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+ * @brief Execute one validated command extracted by radio_bridge.c.
+ *
+ * Packet parsing remains inside the radio bridge. This callback contains only
+ * application policy and calls existing behavior/airbrake APIs, which keeps the
+ * change localized and avoids teaching main.c the protocol wire format.
+ *
+ * @return One RocketAckCode value for the command acknowledgement.
+ */
+uint8_t RadioBridge_ExecuteCommand(uint8_t command,
+                                   const uint8_t *payload,
+                                   uint8_t payload_length,
+                                   uint32_t now_ms,
+                                   uint32_t *detail)
+{
+    if ((payload == NULL) || (detail == NULL))
+    {
+        return ROCKET_ACK_EXECUTION_ERROR;
+    }
+
+    *detail = 0U;
+
+    switch (command)
+    {
+        case ROCKET_CMD_SET_TARGET_APOGEE:
+        {
+            const uint16_t target_decimeters =
+                RocketProtocol_ReadU16(payload);
+
+            if (Behavior_SetTargetApogee(
+                    (float)target_decimeters / 10.0f,
+                    now_ms) != BEHAVIOR_STATUS_OK)
+            {
+                return ROCKET_ACK_BAD_VALUE;
+            }
+
+            *detail = target_decimeters;
+            return ROCKET_ACK_OK;
+        }
+
+        case ROCKET_CMD_SET_CONTROLLER:
+        {
+            const bool enabled = (payload[0] != 0U);
+
+            /*
+             * Do not change controller ownership while a relative motor-step
+             * movement is active. Percentage and automatic commands must wait
+             * until the deferred motor-step acknowledgement is returned.
+             */
+            if (Airbrake_IsManualStepActive())
+            {
+                return ROCKET_ACK_BUSY;
+            }
+
+            /*
+             * SET_CONTROLLER,1 enables automatic airbrake control.
+             *
+             * SET_CONTROLLER,0 disables automatic control and commands the
+             * safe fully retracted 0% position through behavior.c.
+             */
+            if (Behavior_SetControllerEnabled(enabled) !=
+                BEHAVIOR_STATUS_OK)
+            {
+                return ROCKET_ACK_EXECUTION_ERROR;
+            }
+
+            g_airbrakes_enabled = enabled;
+
+            /*
+             * Automatic and disabled modes do not use manual override.
+             * A later manual percentage command explicitly enables it again.
+             */
+            Airbrake_SetManualOverride(false);
+
+            *detail = payload[0];
+            return ROCKET_ACK_OK;
+        }
+
+        case ROCKET_CMD_SET_MODE:
+        {
+            const uint8_t mode = payload[0];
+            const uint16_t duration_s =
+                RocketProtocol_ReadU16(payload + 1U);
+
+            if (Behavior_RequestMode(
+                    (BehaviorMode_t)mode,
+                    (uint32_t)duration_s * 1000U,
+                    now_ms) != BEHAVIOR_STATUS_OK)
+            {
+                return ROCKET_ACK_BAD_VALUE;
+            }
+
+            g_measurement_updates_enabled =
+                (mode != ROCKET_MODE_STANDBY);
+
+            *detail = mode;
+            return ROCKET_ACK_OK;
+        }
+
+        case ROCKET_CMD_RETURN_STANDARD:
+            Behavior_ReturnToStandard(now_ms);
+            g_measurement_updates_enabled = true;
+            return ROCKET_ACK_OK;
+
+        case ROCKET_CMD_MANUAL_AIRBRAKE:
+        {
+            HAL_StatusTypeDef status;
+
+            /*
+             * A percentage command cannot replace an unfinished relative-step
+             * movement. The caller must wait for the deferred motor ACK.
+             */
+            if (Airbrake_IsManualStepActive())
+            {
+                return ROCKET_ACK_BUSY;
+            }
+
+            /*
+             * Sending an explicit position selects manual control.
+             *
+             * This intentionally re-enables the airbrake actuator even if it
+             * was previously disabled. The command itself is an explicit
+             * request to enter manual mode and move to the supplied position.
+             */
+            if (Behavior_SetControllerEnabled(false) !=
+                BEHAVIOR_STATUS_OK)
+            {
+                return ROCKET_ACK_EXECUTION_ERROR;
+            }
+
+            g_airbrakes_enabled = true;
+            Airbrake_SetManualOverride(true);
+
+            status = Airbrake_SetTargetPercent(payload[0]);
+            *detail = payload[0];
+
+            if (status == HAL_BUSY)
+            {
+                return ROCKET_ACK_BUSY;
+            }
+
+            return (status == HAL_OK)
+                ? ROCKET_ACK_OK
+                : ROCKET_ACK_EXECUTION_ERROR;
+        }
+
+        case ROCKET_CMD_SET_SUBSYSTEM:
+        {
+            const uint8_t subsystem = payload[0];
+            const bool enabled = (payload[1] != 0U);
+
+            if (subsystem == ROCKET_SUBSYSTEM_FLIGHT_COMPUTER)
+            {
+                if (!enabled)
+                {
+                    HAL_StatusTypeDef retract_status;
+
+                    /*
+                     * Do not interrupt a relative motor movement. Its deferred
+                     * completion ACK must occur before shutdown can continue.
+                     */
+                    if (Airbrake_IsManualStepActive())
+                    {
+                        return ROCKET_ACK_BUSY;
+                    }
+
+                    /*
+                     * Disable the automatic controller. The unchanged
+                     * Behavior_SetControllerEnabled(false) implementation also
+                     * requests the safe 0% position.
+                     */
+                    if (Behavior_SetControllerEnabled(false) !=
+                        BEHAVIOR_STATUS_OK)
+                    {
+                        return ROCKET_ACK_EXECUTION_ERROR;
+                    }
+
+                    /*
+                     * Reissue the 0% request directly so this command can check
+                     * whether the actuator accepted the safe target. The
+                     * behavior function itself discards this HAL status.
+                     */
+                    retract_status = Airbrake_Retract();
+
+                    if (retract_status == HAL_BUSY)
+                    {
+                        return ROCKET_ACK_BUSY;
+                    }
+
+                    if (retract_status != HAL_OK)
+                    {
+                        return ROCKET_ACK_EXECUTION_ERROR;
+                    }
+
+                    Airbrake_SetManualOverride(false);
+                    g_airbrakes_enabled = false;
+                }
+
+                /*
+                 * Normal behavior processing is suspended only after the safe
+                 * retraction target has been accepted.
+                 */
+                g_flight_computer_enabled = enabled;
+
+                *detail =
+                    ((uint32_t)subsystem << 8) |
+                    payload[1];
+
+                return ROCKET_ACK_OK;
+            }
+
+            /*
+             * Radio enable/disable remains private to radio_bridge.c.
+             */
+            return ROCKET_ACK_UNSUPPORTED;
+        }
+        case ROCKET_CMD_MOTOR_STEPS:
+        {
+            /*
+             * A zero-length invocation is an internal completion poll from
+             * RadioBridge_Task(). It is not a wire-format motor command.
+             */
+            if (payload_length == 0U)
+            {
+                HAL_StatusTypeDef update_status;
+                Airbrake_Telemetry_t airbrake;
+
+                /*
+                 * Service the movement here so it continues even when Behavior
+                 * updates are suspended by standby or flight-computer disable.
+                 */
+                update_status = Airbrake_Update(now_ms);
+                airbrake = Airbrake_GetTelemetry();
+
+                if (Airbrake_IsManualStepActive())
+                {
+                    return ROCKET_ACK_BUSY;
+                }
+
+                if ((airbrake.state == AIRBRAKE_STATE_FAULT) ||
+                    (update_status == HAL_ERROR) ||
+                    (update_status == HAL_TIMEOUT))
+                {
+                    *detail = airbrake.faults;
+                    return ROCKET_ACK_EXECUTION_ERROR;
+                }
+
+                /*
+                 * On success, return the physical final motor position.
+                 */
+                *detail = (uint32_t)airbrake.xactual;
+                return ROCKET_ACK_OK;
+            }
+
+
+            if (payload_length != 2U)
+            {
+                return ROCKET_ACK_BAD_LENGTH;
+            }
+
+            /*
+             * Relative motor movements are unavailable while the airbrake
+             * subsystem is explicitly disabled.
+             *
+             * Unlike MANUAL_AIRBRAKE, MOTOR_STEPS is a low-level maintenance
+             * operation and does not override the disabled state.
+             */
+            if (!g_airbrakes_enabled)
+            {
+                return ROCKET_ACK_BUSY;
+            }
+
+            {
+                const int16_t steps =
+                    RocketProtocol_ReadI16(payload);
+
+                const HAL_StatusTypeDef status =
+                    Airbrake_MoveRelativeSteps(steps);
+
+                /*
+                 * Preserve the signed requested step count in the ACK detail.
+                 */
+                *detail = (uint32_t)(int32_t)steps;
+
+                if (status == HAL_BUSY)
+                {
+                    return ROCKET_ACK_BUSY;
+                }
+
+                return (status == HAL_OK)
+                    ? ROCKET_ACK_OK
+                    : ROCKET_ACK_EXECUTION_ERROR;
+            }
+        }
+
+        case ROCKET_CMD_REQUEST_DIAGNOSTICS:
+        {
+            const uint8_t group = payload[0];
+            const uint8_t value_index =
+                (payload_length >= 2U) ? payload[1] : 0U;
+
+            /*
+             * The radio bridge handles radio diagnostics directly because the
+             * counters and radio gates are private to radio_bridge.c.
+             */
+            if (group == ROCKET_DIAG_RADIO)
+            {
+                return ROCKET_ACK_UNSUPPORTED;
+            }
+
+            if (group == ROCKET_DIAG_SENSORS)
+            {
+                uint32_t failed_reads;
+
+                if ((g_behavior_telemetry == NULL) ||
+                    (value_index != 0U))
+                {
+                    return ROCKET_ACK_BAD_VALUE;
+                }
+
+                failed_reads = g_behavior_telemetry->failed_reads;
+                if (failed_reads > 255U)
+                {
+                    failed_reads = 255U;
+                }
+
+                /*
+                 * One compressed sensor ACK:
+                 *
+                 * [7:0]   IMU HAL status
+                 * [15:8]  magnetometer HAL status
+                 * [23:16] barometer HAL status
+                 * [31:24] failed-read count, saturated at 255
+                 */
+                *detail =
+                    ((uint32_t)(uint8_t)
+                        g_behavior_telemetry->imu_status) |
+                    ((uint32_t)(uint8_t)
+                        g_behavior_telemetry->mag_status << 8) |
+                    ((uint32_t)(uint8_t)
+                        g_behavior_telemetry->baro_status << 16) |
+                    (failed_reads << 24);
+
+                return ROCKET_ACK_OK;
+            }
+
+            if (group == ROCKET_DIAG_ESTIMATOR)
+            {
+                int32_t first;
+                int32_t second;
+
+                if (g_behavior_telemetry == NULL)
+                {
+                    return ROCKET_ACK_EXECUTION_ERROR;
+                }
+
+                switch (value_index)
+                {
+                    case 0U:
+                        /*
+                         * [15:0]  altitude in 0.1 m, signed
+                         * [31:16] velocity in 0.01 m/s, signed
+                         */
+                        if (g_behavior_telemetry->ekf_data_valid)
+                        {
+                            first = (int32_t)
+                                (g_behavior_telemetry->ekf_altitude_m *
+                                 10.0f);
+                            second = (int32_t)
+                                (g_behavior_telemetry->ekf_velocity_m_s *
+                                 100.0f);
+                        }
+                        else
+                        {
+                            first = 0;
+                            second = 0;
+                        }
+
+                        if (first > 32767)  { first = 32767; }
+                        if (first < -32768) { first = -32768; }
+                        if (second > 32767)  { second = 32767; }
+                        if (second < -32768) { second = -32768; }
+
+                        *detail =
+                            (uint32_t)(uint16_t)(int16_t)first |
+                            ((uint32_t)(uint16_t)(int16_t)second << 16);
+
+                        return ROCKET_ACK_OK;
+
+                    case 1U:
+                        /*
+                         * [15:0]  acceleration in 0.01 m/s^2, signed
+                         * [31:16] predicted apogee in 0.1 m, unsigned
+                         */
+                        if (g_behavior_telemetry->ekf_data_valid)
+                        {
+                            first = (int32_t)
+                                (g_behavior_telemetry->
+                                    ekf_acceleration_m_s2 * 100.0f);
+                        }
+                        else
+                        {
+                            first = 0;
+                        }
+
+                        if (g_behavior_telemetry->
+                            controller_output_valid)
+                        {
+                            second = (int32_t)
+                                (g_behavior_telemetry->
+                                    predicted_apogee_m * 10.0f);
+                        }
+                        else
+                        {
+                            second = 0;
+                        }
+
+                        if (first > 32767)  { first = 32767; }
+                        if (first < -32768) { first = -32768; }
+                        if (second > 65535) { second = 65535; }
+                        if (second < 0)     { second = 0; }
+
+                        *detail =
+                            (uint32_t)(uint16_t)(int16_t)first |
+                            ((uint32_t)(uint16_t)second << 16);
+
+                        return ROCKET_ACK_OK;
+
+                    case 2U:
+                    {
+                        uint32_t target_dm;
+                        uint32_t flags = 0U;
+
+                        /*
+                         * [15:0]  target apogee in 0.1 m
+                         * [22:16] requested deployment percent
+                         * [27:23] validity/control flags
+                         */
+                        first = (int32_t)
+                            (g_behavior_telemetry->
+                                target_apogee_m * 10.0f);
+
+                        if (first < 0)
+                        {
+                            target_dm = 0U;
+                        }
+                        else if (first > 65535)
+                        {
+                            target_dm = 65535U;
+                        }
+                        else
+                        {
+                            target_dm = (uint32_t)first;
+                        }
+
+                        if (g_behavior_telemetry->ekf_data_valid)
+                        {
+                            flags |= 0x01U;
+                        }
+                        if (g_behavior_telemetry->fusion_data_valid)
+                        {
+                            flags |= 0x02U;
+                        }
+                        if (g_behavior_telemetry->controller_enabled)
+                        {
+                            flags |= 0x04U;
+                        }
+                        if (g_behavior_telemetry->controller_active)
+                        {
+                            flags |= 0x08U;
+                        }
+                        if (g_behavior_telemetry->
+                            controller_output_valid)
+                        {
+                            flags |= 0x10U;
+                        }
+
+                        *detail =
+                            target_dm |
+                            ((uint32_t)
+                                (g_behavior_telemetry->
+                                    controller_requested_percent &
+                                 0x7FU) << 16) |
+                            ((flags & 0x1FU) << 23);
+
+                        return ROCKET_ACK_OK;
+                    }
+
+                    default:
+                        return ROCKET_ACK_BAD_VALUE;
+                }
+            }
+
+            if (group == ROCKET_DIAG_AIRBRAKE)
+            {
+                const Airbrake_Telemetry_t airbrake =
+                    Airbrake_GetTelemetry();
+
+                switch (value_index)
+                {
+                    case 0U:
+                        *detail = (uint32_t)airbrake.xactual;
+                        return ROCKET_ACK_OK;
+
+                    case 1U:
+                        *detail = (uint32_t)airbrake.target_counts;
+                        return ROCKET_ACK_OK;
+
+                    case 2U:
+                        *detail = airbrake.faults;
+                        return ROCKET_ACK_OK;
+
+                    case 3U:
+                        *detail = airbrake.last_drv_status;
+                        return ROCKET_ACK_OK;
+
+                    case 4U:
+                        *detail = airbrake.last_gstat;
+                        return ROCKET_ACK_OK;
+
+                    case 5U:
+                        /*
+                         * bits 0-3:   Airbrake_State_t
+                         * bits 4-10:  current percentage
+                         * bits 11-17: target percentage
+                         * bit 18:     calibrated
+                         * bit 19:     deployment allowed
+                         * bit 20:     manual override
+                         * bit 21:     thermal limited
+                         * bit 22:     manual-step ownership
+                         * bit 23:     actuator moving
+                         */
+                        *detail =
+                            ((uint32_t)airbrake.state & 0x0FU) |
+                            ((uint32_t)
+                                (airbrake.current_percent & 0x7FU) << 4) |
+                            ((uint32_t)
+                                (airbrake.target_percent & 0x7FU) << 11) |
+                            (airbrake.calibrated ? (1UL << 18) : 0U) |
+                            (airbrake.deployment_allowed
+                                ? (1UL << 19) : 0U) |
+                            (airbrake.manual_override
+                                ? (1UL << 20) : 0U) |
+                            (airbrake.thermal_limited
+                                ? (1UL << 21) : 0U) |
+                            (Airbrake_IsManualStepActive()
+                                ? (1UL << 22) : 0U) |
+                            (Airbrake_IsBusy()
+                                ? (1UL << 23) : 0U);
+
+                        return ROCKET_ACK_OK;
+
+                    default:
+                        return ROCKET_ACK_BAD_VALUE;
+                }
+            }
+
+            if (group == ROCKET_DIAG_STORAGE)
+            {
+                /*
+                 * STORAGE IMPLEMENTATION GOES HERE.
+                 *
+                 * When storage exists, value_index 0 can return a compressed
+                 * status word such as:
+                 *
+                 * bits 0-7:   storage state
+                 * bits 8-15:  last error
+                 * bits 16-31: sectors or records used
+                 */
+                *detail = 0U;
+                return ROCKET_ACK_UNSUPPORTED;
+            }
+
+            return ROCKET_ACK_BAD_VALUE;
+        }
+
+        case ROCKET_CMD_CLEAR_FAULTS:
+        {
+            const HAL_StatusTypeDef status =
+                Airbrake_ClearFaults();
+            const Airbrake_Telemetry_t airbrake =
+                Airbrake_GetTelemetry();
+
+            /*
+             * Report any fault bits that remain after the attempt.
+             */
+            *detail = airbrake.faults;
+
+            return ((status == HAL_OK) &&
+                    (airbrake.faults == AIRBRAKE_FAULT_NONE))
+                ? ROCKET_ACK_OK
+                : ROCKET_ACK_EXECUTION_ERROR;
+        }
+
+        default:
+            return ROCKET_ACK_UNSUPPORTED;
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -231,33 +863,64 @@ int main(void)
 	  // basically needed for anything regarding timing
       const uint32_t now_ms = HAL_GetTick();
 
-      // change to true in debug menu if you have a new config you want to apply
-      if (g_apply_behavior_config)
+      /*
+       * Track whether Behavior_Update() serviced the actuator during this
+       * iteration. During standby or flight-computer disable, the airbrake
+       * still requires periodic supervision while returning to 0%.
+       */
+      bool behavior_updated = false;
+
+      /*
+       * Flight-computer disable suspends all normal application logic. The
+       * radio task remains outside this gate so commands can re-enable it.
+       */
+      if (g_flight_computer_enabled)
       {
-          g_apply_behavior_config = false;
-          (void)Behavior_ApplyConfig(&g_behavior_config, now_ms);
+          // change to true in debug menu if you have a new config you want to apply
+          if (g_apply_behavior_config)
+          {
+              g_apply_behavior_config = false;
+              (void)Behavior_ApplyConfig(&g_behavior_config, now_ms);
+          }
+
+          // was for the comprehensive ekf->motor test, this can be removed if you don't want it
+          if (g_request_comprehensive_test)
+          {
+              g_request_comprehensive_test = false;
+              (void)Behavior_RequestMode(
+                  BEHAVIOR_MODE_TEST_FULL_PIPELINE,
+                  0U,
+                  now_ms);
+          }
+
+          // change in debug menu to return to standard mode.
+          if (g_request_standard_mode)
+          {
+              g_request_standard_mode = false;
+              Behavior_ReturnToStandard(now_ms);
+              g_measurement_updates_enabled = true;
+          }
+
+          /* Standby skips new Behavior measurements/estimation/control while
+           * still allowing configuration and command processing. */
+          if (g_measurement_updates_enabled)
+          {
+              Behavior_Update(now_ms);
+              behavior_updated = true;
+          }
       }
 
-      // was for the comprehensive ekf->motor test, this can be removed if you don't want it
-      if (g_request_comprehensive_test)
+      /*
+       * Behavior_Update() normally calls Airbrake_Update(). When behavior is
+       * suspended, continue servicing motor feedback, timeout detection,
+       * thermal limiting, and completion of the safe retraction.
+       */
+      if (!behavior_updated)
       {
-          g_request_comprehensive_test = false;
-          (void)Behavior_RequestMode(
-              BEHAVIOR_MODE_TEST_FULL_PIPELINE,
-              0U,
-              now_ms);
+          (void)Airbrake_Update(now_ms);
       }
 
-      // change in debug menu to return to standard mode.
-      if (g_request_standard_mode)
-      {
-          g_request_standard_mode = false;
-          Behavior_ReturnToStandard(now_ms);
-      }
-
-      // update tick
-      Behavior_Update(now_ms);
-      // send data
+      /* Command interpretation and acknowledgements are never suspended. */
       RadioBridge_Task(g_behavior_telemetry, now_ms);
 
       // tons of test and debug displays
@@ -297,7 +960,7 @@ int main(void)
 //      Airbrake_Update(now_ms);
 //      Airbrake_SetTargetPercent((uint8_t) (deploy * 100));
 
-      // delay is needed for tests, but comment out if you
+      // delay is needed for tests, but comment out
       HAL_Delay(10u);
       // airbrake actuation happens inside behavior
 

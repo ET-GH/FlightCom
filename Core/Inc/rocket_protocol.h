@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define ROCKET_PROTOCOL_MAGIC        0xA5u
-#define ROCKET_PROTOCOL_VERSION      0x02u
+#define ROCKET_PROTOCOL_VERSION      0x03u
 #define ROCKET_PROTOCOL_HEADER_SIZE  9u
 #define ROCKET_PROTOCOL_MAX_PACKET   64u
 
@@ -30,8 +30,38 @@ typedef enum {
     ROCKET_CMD_SET_CONTROLLER      = 0x11, /* payload: uint8 0/1 */
     ROCKET_CMD_SET_MODE            = 0x12, /* payload: uint8 mode, uint16 duration_s */
     ROCKET_CMD_RETURN_STANDARD     = 0x13,
-    ROCKET_CMD_MANUAL_AIRBRAKE     = 0x14  /* payload: uint8 percent */
+    ROCKET_CMD_MANUAL_AIRBRAKE     = 0x14, /* payload: uint8 percent */
+    ROCKET_CMD_SET_SUBSYSTEM       = 0x15, /* payload: uint8 subsystem, uint8 0/1 */
+    ROCKET_CMD_MOTOR_STEPS         = 0x16, /* payload: int16 signed steps */
+    ROCKET_CMD_REQUEST_DIAGNOSTICS = 0x17, /* payload: uint8 diagnostics group */
+    ROCKET_CMD_CLEAR_FAULTS        = 0x18  /* no payload */
 } RocketCommandCode;
+
+
+/* Values used by ROCKET_CMD_SET_SUBSYSTEM. "Flight computer" means its
+ * software/arming state; the MCU cannot remove its own electrical power. */
+typedef enum {
+    ROCKET_SUBSYSTEM_RADIO           = 0x00,
+    ROCKET_SUBSYSTEM_FLIGHT_COMPUTER = 0x01
+} RocketSubsystemId;
+
+/* Values used by ROCKET_CMD_SET_MODE. */
+typedef enum {
+    ROCKET_MODE_STANDBY = 0x00,
+    ROCKET_MODE_ACTIVE  = 0x01,
+    ROCKET_MODE_SAFE    = 0x02,
+    ROCKET_MODE_TEST    = 0x03
+} RocketModeCode;
+
+/* Values used by ROCKET_CMD_REQUEST_DIAGNOSTICS. */
+typedef enum {
+    ROCKET_DIAG_ALL       = 0x00,
+    ROCKET_DIAG_RADIO     = 0x01,
+    ROCKET_DIAG_SENSORS   = 0x02,
+    ROCKET_DIAG_ESTIMATOR = 0x03,
+    ROCKET_DIAG_AIRBRAKE  = 0x04,
+    ROCKET_DIAG_STORAGE   = 0x05
+} RocketDiagnosticsGroup;
 
 typedef enum {
     ROCKET_ACK_OK              = 0x00,
@@ -42,6 +72,16 @@ typedef enum {
     ROCKET_ACK_EXECUTION_ERROR = 0x05,
     ROCKET_ACK_BAD_CRC         = 0x06
 } RocketAckCode;
+
+/* detail_type identifies the meaning of the 32-bit ACK detail field. Ping
+ * statistics use three ACKs: uptime, compressed counters, and signal data. */
+typedef enum {
+    ROCKET_ACK_DETAIL_NONE          = 0x00,
+    ROCKET_ACK_DETAIL_PING_UPTIME   = 0x01,
+    ROCKET_ACK_DETAIL_PING_COUNTERS = 0x02,
+    ROCKET_ACK_DETAIL_PING_SIGNAL   = 0x03,
+    ROCKET_ACK_DETAIL_DIAGNOSTIC    = 0x10
+} RocketAckDetailType;
 
 typedef enum {
     ROCKET_STATUS_OK                 = 0x00,
@@ -145,11 +185,16 @@ typedef struct {
     uint8_t payload[8];
 } RocketCommandPayload;
 
+/* 11-byte wire payload. Normal ACKs use part_index=0 and part_count=1.
+ * PING uses multiple ACKs sharing the same command_sequence. */
 typedef struct {
     uint16_t command_sequence;
     uint8_t command;
     uint8_t result;
-    uint16_t detail;
+    uint8_t detail_type;
+    uint8_t part_index;
+    uint8_t part_count;
+    uint32_t detail;
 } RocketAckPayload;
 
 static inline void RocketProtocol_WriteU16(uint8_t *p, uint16_t v) {
@@ -169,6 +214,24 @@ static inline int16_t RocketProtocol_ReadI16(const uint8_t *p) {
 }
 static inline uint32_t RocketProtocol_ReadU32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* Compressed ping counters are counts since the previous ping. Each field
+ * saturates at 255. Signal values remain signed fixed-point quantities. */
+static inline uint32_t RocketProtocol_PackPingCounters(uint8_t tx_packets,
+                                                        uint8_t rx_packets,
+                                                        uint8_t tx_errors,
+                                                        uint8_t rx_errors) {
+    return ((uint32_t)tx_packets << 24) |
+           ((uint32_t)rx_packets << 16) |
+           ((uint32_t)tx_errors << 8) |
+           (uint32_t)rx_errors;
+}
+
+static inline uint32_t RocketProtocol_PackPingSignal(int16_t rssi_dbm_x10,
+                                                      int16_t snr_db_x100) {
+    return ((uint32_t)(uint16_t)rssi_dbm_x10 << 16) |
+           (uint16_t)snr_db_x100;
 }
 
 static inline uint16_t RocketProtocol_Crc16(const uint8_t *data, size_t length) {
@@ -254,6 +317,10 @@ static inline const char *RocketProtocol_CommandText(uint8_t code) {
         case ROCKET_CMD_SET_MODE: return "SET_MODE";
         case ROCKET_CMD_RETURN_STANDARD: return "RETURN_STANDARD";
         case ROCKET_CMD_MANUAL_AIRBRAKE: return "MANUAL_AIRBRAKE";
+        case ROCKET_CMD_SET_SUBSYSTEM: return "SET_SUBSYSTEM";
+        case ROCKET_CMD_MOTOR_STEPS: return "MOTOR_STEPS";
+        case ROCKET_CMD_REQUEST_DIAGNOSTICS: return "REQUEST_DIAGNOSTICS";
+        case ROCKET_CMD_CLEAR_FAULTS: return "CLEAR_FAULTS";
         default: return "UNKNOWN_COMMAND";
     }
 }

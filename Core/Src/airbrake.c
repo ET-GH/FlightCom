@@ -55,6 +55,14 @@ static uint32_t ab_burnout_time_ms = 0U;
 /** Timestamp at which the current position command began. */
 static uint32_t ab_move_start_ms = 0U;
 
+/*
+ * True while a relative motor-step command owns the actuator.
+ *
+ * Percentage commands, including automatic controller commands, are rejected
+ * until the relative movement reaches its target or faults.
+ */
+static bool ab_manual_step_active = false;
+
 /* -------------------------------------------------------------------------- */
 /* Private function declarations                                              */
 /* -------------------------------------------------------------------------- */
@@ -158,6 +166,8 @@ HAL_StatusTypeDef Airbrake_Init(const Airbrake_Config_t *cfg)
     ab_prev_accel_g = 0.0f;
     ab_burnout_time_ms = 0U;
     ab_move_start_ms = 0U;
+
+    ab_manual_step_active = false;
 
     if (TMC5240_InitBasic() != HAL_OK)
     {
@@ -286,6 +296,14 @@ bool Airbrake_IsBusy(void)
 }
 
 /**
+ * @return true while a relative motor-step command owns the actuator.
+ */
+bool Airbrake_IsManualStepActive(void)
+{
+    return ab_manual_step_active;
+}
+
+/**
  * @return true when extension is allowed by the flight gate or manual override.
  */
 bool Airbrake_IsDeploymentAllowed(void)
@@ -344,6 +362,119 @@ HAL_StatusTypeDef Airbrake_SetTargetPercent(uint8_t percent)
     status = Airbrake_ApplyMotionProfile(false);
     if (status != HAL_OK)
     {
+        Airbrake_EnterFault(AIRBRAKE_FAULT_SPI);
+        return status;
+    }
+
+    /*
+     * A relative movement has exclusive ownership. This rejects:
+     *
+     * 1. Radio percentage commands.
+     * 2. Automatic controller deployment commands.
+     * 3. Controller-disabled automatic retraction commands.
+     */
+    if (ab_manual_step_active)
+    {
+        return HAL_BUSY;
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief Move the airbrake motor by a signed relative number of steps.
+ *
+ * Positive values always mean physical deployment and negative values always
+ * mean physical retraction. The calibrated open/closed count direction is used
+ * to convert that physical meaning into the correct motor-count direction.
+ *
+ * This function intentionally does not clamp the target to the calibrated
+ * mechanical open/closed positions. It only prevents signed 32-bit overflow.
+ *
+ * An existing normal percentage movement may be replaced by this command.
+ * Another relative movement is rejected until the first one completes.
+ */
+HAL_StatusTypeDef Airbrake_MoveRelativeSteps(int16_t steps)
+{
+    const int32_t deployment_direction =
+        (ab_cfg.open_counts >= ab_cfg.closed_counts) ? 1 : -1;
+
+    int32_t xactual = 0;
+    int64_t target;
+    HAL_StatusTypeDef status;
+
+    if (!ab.calibrated)
+    {
+        ab.faults |= AIRBRAKE_FAULT_NOT_CALIBRATED;
+        return HAL_ERROR;
+    }
+
+    if (ab.state == AIRBRAKE_STATE_FAULT)
+    {
+        return HAL_ERROR;
+    }
+
+    if (ab_manual_step_active)
+    {
+        return HAL_BUSY;
+    }
+
+    if (Airbrake_ReadDriverStatus() != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    if (TMC5240_GetXACTUAL(&xactual) != HAL_OK)
+    {
+        Airbrake_EnterFault(AIRBRAKE_FAULT_SPI);
+        return HAL_ERROR;
+    }
+
+    /*
+     * Positive protocol steps always deploy, even when deployment corresponds
+     * to decreasing motor counts.
+     */
+    target =
+        (int64_t)xactual +
+        ((int64_t)steps * (int64_t)deployment_direction);
+
+    /*
+     * No mechanical bounds are applied. Only protect the TMC5240 signed
+     * position representation from arithmetic overflow.
+     */
+    if ((target > (int64_t)INT32_MAX) ||
+        (target < (int64_t)INT32_MIN))
+    {
+        return HAL_ERROR;
+    }
+
+    ab.xactual = xactual;
+    ab.target_counts = (int32_t)target;
+    ab.target_percent = Airbrake_CountsToPercent(ab.target_counts);
+    ab_move_start_ms = HAL_GetTick();
+
+    /*
+     * A zero-step request is already complete. The bridge will produce the
+     * completion ACK during its next completion poll.
+     */
+    if (steps == 0)
+    {
+        ab.state = AIRBRAKE_STATE_HOLDING;
+        ab_manual_step_active = false;
+        return HAL_OK;
+    }
+
+    ab_manual_step_active = true;
+    ab.state = AIRBRAKE_STATE_MOVING;
+
+    /*
+     * Reuse the existing configured actuator motion profile and preserve
+     * thermal limiting when it is already active.
+     */
+    status = Airbrake_ApplyMotionProfile(ab.thermal_limited);
+    if (status != HAL_OK)
+    {
+        ab_manual_step_active = false;
         Airbrake_EnterFault(AIRBRAKE_FAULT_SPI);
         return status;
     }
@@ -435,6 +566,7 @@ HAL_StatusTypeDef Airbrake_Update(uint32_t now_ms)
 
             ab.current_percent = ab.target_percent;
             ab.state = AIRBRAKE_STATE_HOLDING;
+            ab_manual_step_active = false;
         }
         else if ((uint32_t)(now_ms - ab_move_start_ms) >
                  ab_cfg.move_timeout_ms)
@@ -459,6 +591,96 @@ void Airbrake_EStop(void)
 Airbrake_Telemetry_t Airbrake_GetTelemetry(void)
 {
     return ab;
+}
+
+/**
+ * @brief Clear recoverable airbrake and TMC5240 fault latches in place.
+ *
+ * This does not reset:
+ * - motor position,
+ * - target position,
+ * - calibration,
+ * - launch or burnout state,
+ * - deployment permission,
+ * - manual override,
+ * - Behavior,
+ * - EKF,
+ * - controller state,
+ * - flight-computer state.
+ *
+ * If the physical hardware fault remains active, this function fails and the
+ * actuator remains faulted.
+ */
+HAL_StatusTypeDef Airbrake_ClearFaults(void)
+{
+    uint32_t drv_status = 0U;
+    uint32_t gstat = 0U;
+    const Airbrake_State_t previous_state = ab.state;
+
+    /*
+     * Configuration errors cannot safely be cleared without correcting the
+     * actual configuration.
+     */
+    if (!ab.calibrated ||
+        (ab_cfg.closed_counts == ab_cfg.open_counts))
+    {
+        return HAL_ERROR;
+    }
+
+    /*
+     * GSTAT uses write-one-to-clear bits. This is the same mask already used
+     * during TMC5240 initialization.
+     */
+    if (TMC5240_WriteReg(TMC5240_REG_GSTAT, 0x0000001FU) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    /*
+     * Read the actual hardware state after clearing the stored status bits.
+     */
+    if ((TMC5240_GetDRV_STATUS(&drv_status) != HAL_OK) ||
+        (TMC5240_GetGSTAT(&gstat) != HAL_OK))
+    {
+        return HAL_ERROR;
+    }
+
+    ab.last_drv_status = drv_status;
+    ab.last_gstat = gstat;
+
+    /*
+     * Do not falsely report success while a physical short, overtemperature,
+     * undervoltage, driver error, or charge-pump fault is still present.
+     */
+    if (((drv_status & AIRBRAKE_TMC_SHORT_MASK) != 0U) ||
+        ((drv_status & TMC5240_DRV_OT) != 0U) ||
+        ((gstat & AIRBRAKE_TMC_GSTAT_MASK) != 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    ab.faults = AIRBRAKE_FAULT_NONE;
+    ab.thermal_limited =
+        ((drv_status & TMC5240_DRV_OTPW) != 0U);
+
+    /*
+     * Re-enable the bridge only if an actuator fault had disabled it.
+     * Do not restart the previous movement.
+     */
+    if (previous_state == AIRBRAKE_STATE_FAULT)
+    {
+        if (TMC5240_EnableDriver() != HAL_OK)
+        {
+            Airbrake_EnterFault(AIRBRAKE_FAULT_TMC_STATUS);
+            return HAL_ERROR;
+        }
+
+        ab.state = Airbrake_IsDeploymentAllowed()
+            ? AIRBRAKE_STATE_READY
+            : AIRBRAKE_STATE_LOCKED;
+    }
+
+    return HAL_OK;
 }
 
 /* ========================================================================== */
@@ -576,6 +798,7 @@ static void Airbrake_EnterFault(uint32_t fault_bits)
 {
     ab.faults |= fault_bits;
     ab.state = AIRBRAKE_STATE_FAULT;
+    ab_manual_step_active = false;
 
     (void)TMC5240_StopVelocity();
     TMC5240_DisableDriver();
