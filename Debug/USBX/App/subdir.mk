@@ -7,16 +7,19 @@
 C_SRCS += \
 ../USBX/App/app_usbx.c \
 ../USBX/App/app_usbx_device.c \
+../USBX/App/ux_device_cdc_acm.c \
 ../USBX/App/ux_device_descriptors.c 
 
 OBJS += \
 ./USBX/App/app_usbx.o \
 ./USBX/App/app_usbx_device.o \
+./USBX/App/ux_device_cdc_acm.o \
 ./USBX/App/ux_device_descriptors.o 
 
 C_DEPS += \
 ./USBX/App/app_usbx.d \
 ./USBX/App/app_usbx_device.d \
+./USBX/App/ux_device_cdc_acm.d \
 ./USBX/App/ux_device_descriptors.d 
 
 
@@ -27,7 +30,7 @@ USBX/App/%.o USBX/App/%.su USBX/App/%.cyclo: ../USBX/App/%.c USBX/App/subdir.mk
 clean: clean-USBX-2f-App
 
 clean-USBX-2f-App:
-	-$(RM) ./USBX/App/app_usbx.cyclo ./USBX/App/app_usbx.d ./USBX/App/app_usbx.o ./USBX/App/app_usbx.su ./USBX/App/app_usbx_device.cyclo ./USBX/App/app_usbx_device.d ./USBX/App/app_usbx_device.o ./USBX/App/app_usbx_device.su ./USBX/App/ux_device_descriptors.cyclo ./USBX/App/ux_device_descriptors.d ./USBX/App/ux_device_descriptors.o ./USBX/App/ux_device_descriptors.su
+	-$(RM) ./USBX/App/app_usbx.cyclo ./USBX/App/app_usbx.d ./USBX/App/app_usbx.o ./USBX/App/app_usbx.su ./USBX/App/app_usbx_device.cyclo ./USBX/App/app_usbx_device.d ./USBX/App/app_usbx_device.o ./USBX/App/app_usbx_device.su ./USBX/App/ux_device_cdc_acm.cyclo ./USBX/App/ux_device_cdc_acm.d ./USBX/App/ux_device_cdc_acm.o ./USBX/App/ux_device_cdc_acm.su ./USBX/App/ux_device_descriptors.cyclo ./USBX/App/ux_device_descriptors.d ./USBX/App/ux_device_descriptors.o ./USBX/App/ux_device_descriptors.su
 
 .PHONY: clean-USBX-2f-App
 

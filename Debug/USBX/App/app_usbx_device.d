@@ -4,9 +4,9 @@ USBX/App/app_usbx_device.o: ../USBX/App/app_usbx_device.c \
  ../Middlewares/ST/usbx/ports/generic/inc/ux_port.h ../USBX/App/ux_user.h \
  ../Middlewares/ST/usbx/common/core/inc/ux_utility.h \
  ../Middlewares/ST/usbx/common/core/inc/ux_system.h \
- ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_hid.h \
- ../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h \
- ../USBX/Target/ux_stm32_config.h \
+ ../USBX/App/ux_device_cdc_acm.h \
+ ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_cdc_acm.h \
+ ../USBX/App/ux_device_descriptors.h ../USBX/Target/ux_stm32_config.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h \
  ../Core/Inc/stm32h5xx_hal_conf.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_rcc.h \
@@ -38,15 +38,17 @@ USBX/App/app_usbx_device.o: ../USBX/App/app_usbx_device.c \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_usb.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd_ex.h \
- ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h
+ ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h \
+ ../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h
 ../USBX/App/app_usbx_device.h:
 ../Middlewares/ST/usbx/common/core/inc/ux_api.h:
 ../Middlewares/ST/usbx/ports/generic/inc/ux_port.h:
 ../USBX/App/ux_user.h:
 ../Middlewares/ST/usbx/common/core/inc/ux_utility.h:
 ../Middlewares/ST/usbx/common/core/inc/ux_system.h:
-../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_hid.h:
-../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h:
+../USBX/App/ux_device_cdc_acm.h:
+../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_cdc_acm.h:
+../USBX/App/ux_device_descriptors.h:
 ../USBX/Target/ux_stm32_config.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
 ../Core/Inc/stm32h5xx_hal_conf.h:
@@ -80,3 +82,4 @@ USBX/App/app_usbx_device.o: ../USBX/App/app_usbx_device.c \
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_usb.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd_ex.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h:
+../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h:

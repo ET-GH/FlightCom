@@ -27,7 +27,7 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "ux_api.h"
 #include "ux_stm32_config.h"
-#include "ux_device_class_hid.h"
+#include "ux_device_class_cdc_acm.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -39,7 +39,7 @@ extern "C" {
 #define USBD_MAX_CLASS_ENDPOINTS                       9U
 #define USBD_MAX_CLASS_INTERFACES                      12U
 
-#define USBD_HID_CLASS_ACTIVATED                       1U
+#define USBD_CDC_ACM_CLASS_ACTIVATED                   1U
 
 #define USBD_CONFIG_MAXPOWER                           25U
 #define USBD_COMPOSITE_USE_IAD                         1U
@@ -67,14 +67,6 @@ typedef enum
   CLASS_TYPE_AUDIO_10 = 11,
   CLASS_TYPE_AUDIO_20 = 12
 } USBD_CompositeClassTypeDef;
-
-/* Enum HID Interface Type */
-typedef enum
-{
-  INTERFACE_HID_CUSTOM     = 0,
-  INTERFACE_HID_KEYBOARD   = 1,
-  INTERFACE_HID_MOUSE      = 2,
-} USBD_HIDInterfaceTypeDef;
 
 /* USB Endpoint handle structure */
 typedef struct
@@ -211,19 +203,46 @@ typedef struct
   uint8_t bReserved;
 } __PACKED USBD_DevQualiDescTypedef;
 
-#if USBD_HID_CLASS_ACTIVATED == 1U
-/* USB HID descriptors structure */
+#if (USBD_CDC_ACM_CLASS_ACTIVATED == 1) || (USBD_RNDIS_CLASS_ACTIVATED == 1) || (USBD_CDC_ECM_CLASS_ACTIVATED == 1)
 typedef struct
 {
+  /* Header Functional Descriptor*/
   uint8_t bLength;
   uint8_t bDescriptorType;
-  uint16_t bcdHID;
-  uint8_t bCountryCode;
-  uint8_t bNumDescriptors;
-  uint8_t bHIDDescriptorType;
-  uint16_t wDescriptorLength;
-} __PACKED USBD_HIDDescTypedef;
-#endif /* USBD_HID_CLASS_ACTIVATED == 1U */
+  uint8_t bDescriptorSubtype;
+  uint16_t bcdCDC;
+} __PACKED USBD_CDCHeaderFuncDescTypedef;
+
+typedef struct
+{
+  /* Call Management Functional Descriptor*/
+  uint8_t bLength;
+  uint8_t bDescriptorType;
+  uint8_t bDescriptorSubtype;
+  uint8_t bmCapabilities;
+  uint8_t bDataInterface;
+} __PACKED USBD_CDCCallMgmFuncDescTypedef;
+
+typedef struct
+{
+  /* ACM Functional Descriptor*/
+  uint8_t bLength;
+  uint8_t bDescriptorType;
+  uint8_t bDescriptorSubtype;
+  uint8_t bmCapabilities;
+} __PACKED USBD_CDCACMFuncDescTypedef;
+
+typedef struct
+{
+  /* Union Functional Descriptor*/
+  uint8_t bLength;
+  uint8_t bDescriptorType;
+  uint8_t bDescriptorSubtype;
+  uint8_t bMasterInterface;
+  uint8_t bSlaveInterface;
+} __PACKED USBD_CDCUnionFuncDescTypedef;
+
+#endif /* (USBD_CDC_ACM_CLASS_ACTIVATED == 1) || (USBD_RNDIS_CLASS_ACTIVATED == 1)  || (USBD_CDC_ECM_CLASS_ACTIVATED == 1)*/
 
 /* Exported functions prototypes ---------------------------------------------*/
 /* USER CODE BEGIN EFP */
@@ -236,10 +255,6 @@ uint8_t *USBD_Get_Language_Id_Framework(ULONG *Length);
 uint16_t USBD_Get_Interface_Number(uint8_t class_type, uint8_t interface_type);
 uint16_t USBD_Get_Configuration_Number(uint8_t class_type, uint8_t interface_type);
 
-#if USBD_HID_CLASS_ACTIVATED == 1U
-uint8_t *USBD_HID_ReportDesc(uint8_t hid_type);
-uint16_t USBD_HID_ReportDesc_length(uint8_t hid_type);
-#endif /* USBD_HID_CLASS_ACTIVATED == 1U */
 /* Private defines -----------------------------------------------------------*/
 /* USER CODE BEGIN Private_defines */
 
@@ -276,6 +291,19 @@ uint16_t USBD_HID_ReportDesc_length(uint8_t hid_type);
 #define USBD_DEVICE_QUALIFIER_DESC_SIZE               0x0AU
 
 #define USBD_STRING_FRAMEWORK_MAX_LENGTH              256U
+
+/* Device CDC-ACM Class */
+#define USBD_CDCACM_EPINCMD_ADDR                      0x81U
+#define USBD_CDCACM_EPINCMD_FS_MPS                    8U
+#define USBD_CDCACM_EPINCMD_HS_MPS                    8U
+#define USBD_CDCACM_EPIN_ADDR                         0x82U
+#define USBD_CDCACM_EPOUT_ADDR                        0x03U
+#define USBD_CDCACM_EPIN_FS_MPS                       64U
+#define USBD_CDCACM_EPIN_HS_MPS                       512U
+#define USBD_CDCACM_EPOUT_FS_MPS                      64U
+#define USBD_CDCACM_EPOUT_HS_MPS                      512U
+#define USBD_CDCACM_EPINCMD_FS_BINTERVAL              5U
+#define USBD_CDCACM_EPINCMD_HS_BINTERVAL              5U
 
 #ifndef USBD_CONFIG_STR_DESC_IDX
 #define USBD_CONFIG_STR_DESC_IDX                      0U

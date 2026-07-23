@@ -253,7 +253,7 @@
    is 2048 bytes but can be reduced in memory constrained environments. For cd-rom support in the storage
    class, this value cannot be less than 2048.  */
 
-/* #define UX_SLAVE_REQUEST_DATA_MAX_LENGTH                 2048 */
+#define UX_SLAVE_REQUEST_DATA_MAX_LENGTH                    256
 
 /* Defined, this enables processing of Get String Descriptor requests with zero Language ID.
    The first language ID in the language ID framework will be used if the request has a zero
@@ -425,7 +425,7 @@
 
 /* Defined, this macro disables CDC ACM non-blocking transmission support. */
 
-/* #define UX_DEVICE_CLASS_CDC_ACM_TRANSMISSION_DISABLE */
+#define UX_DEVICE_CLASS_CDC_ACM_TRANSMISSION_DISABLE
 
 /* Defined, this macro enables device audio feedback endpoint support.  */
 

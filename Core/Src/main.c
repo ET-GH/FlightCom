@@ -145,6 +145,7 @@ uint8_t RadioBridge_ExecuteCommand(uint8_t command,
                                    uint32_t now_ms,
                                    uint32_t *detail);
 
+void MX_USB_PCD_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -778,7 +779,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  MX_USB_PCD_Init();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -792,6 +793,15 @@ int main(void)
   MX_SPI3_Init();
   MX_USBX_Init();
   /* USER CODE BEGIN 2 */
+
+  /*
+   * Connect the device electrically to the USB host.
+   */
+  if (HAL_PCD_Start(&hpcd_USB_DRD_FS) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
   // init radio
   if (RadioBridge_Init() != HAL_OK)
   {
@@ -861,111 +871,121 @@ int main(void)
   while (1)
   {
 	  // basically needed for anything regarding timing
-      const uint32_t now_ms = HAL_GetTick();
+		const uint32_t now_ms = HAL_GetTick();
 
-      /*
-       * Track whether Behavior_Update() serviced the actuator during this
-       * iteration. During standby or flight-computer disable, the airbrake
-       * still requires periodic supervision while returning to 0%.
-       */
-      bool behavior_updated = false;
+		/*
+		 * Track whether Behavior_Update() serviced the actuator during this
+		 * iteration. During standby or flight-computer disable, the airbrake
+		 * still requires periodic supervision while returning to 0%.
+		 */
+		bool behavior_updated = false;
 
-      /*
-       * Flight-computer disable suspends all normal application logic. The
-       * radio task remains outside this gate so commands can re-enable it.
-       */
-      if (g_flight_computer_enabled)
-      {
-          // change to true in debug menu if you have a new config you want to apply
-          if (g_apply_behavior_config)
-          {
-              g_apply_behavior_config = false;
-              (void)Behavior_ApplyConfig(&g_behavior_config, now_ms);
-          }
+		/*
+		 * Flight-computer disable suspends all normal application logic. The
+		 * radio task remains outside this gate so commands can re-enable it.
+		 */
+		if (g_flight_computer_enabled)
+		{
+			// change to true in debug menu if you have a new config you want to apply
+			if (g_apply_behavior_config)
+			{
+				g_apply_behavior_config = false;
+				(void)Behavior_ApplyConfig(&g_behavior_config, now_ms);
+			}
 
-          // was for the comprehensive ekf->motor test, this can be removed if you don't want it
-          if (g_request_comprehensive_test)
-          {
-              g_request_comprehensive_test = false;
-              (void)Behavior_RequestMode(
-                  BEHAVIOR_MODE_TEST_FULL_PIPELINE,
-                  0U,
-                  now_ms);
-          }
+			// was for the comprehensive ekf->motor test, this can be removed if you don't want it
+			if (g_request_comprehensive_test)
+			{
+				g_request_comprehensive_test = false;
+				(void)Behavior_RequestMode(
+					BEHAVIOR_MODE_TEST_FULL_PIPELINE,
+					0U,
+					now_ms);
+			}
 
-          // change in debug menu to return to standard mode.
-          if (g_request_standard_mode)
-          {
-              g_request_standard_mode = false;
-              Behavior_ReturnToStandard(now_ms);
-              g_measurement_updates_enabled = true;
-          }
+			// change in debug menu to return to standard mode.
+			if (g_request_standard_mode)
+			{
+				g_request_standard_mode = false;
+				Behavior_ReturnToStandard(now_ms);
+				g_measurement_updates_enabled = true;
+			}
 
-          /* Standby skips new Behavior measurements/estimation/control while
-           * still allowing configuration and command processing. */
-          if (g_measurement_updates_enabled)
-          {
-              Behavior_Update(now_ms);
-              behavior_updated = true;
-          }
-      }
+			/* Standby skips new Behavior measurements/estimation/control while
+			 * still allowing configuration and command processing. */
+			if (g_measurement_updates_enabled)
+			{
+				Behavior_Update(now_ms);
+				behavior_updated = true;
+			}
+		}
 
-      /*
-       * Behavior_Update() normally calls Airbrake_Update(). When behavior is
-       * suspended, continue servicing motor feedback, timeout detection,
-       * thermal limiting, and completion of the safe retraction.
-       */
-      if (!behavior_updated)
-      {
-          (void)Airbrake_Update(now_ms);
-      }
+		/*
+		 * Behavior_Update() normally calls Airbrake_Update(). When behavior is
+		 * suspended, continue servicing motor feedback, timeout detection,
+		 * thermal limiting, and completion of the safe retraction.
+		 */
+		if (!behavior_updated)
+		{
+			(void)Airbrake_Update(now_ms);
+		}
 
-      /* Command interpretation and acknowledgements are never suspended. */
-      RadioBridge_Task(g_behavior_telemetry, now_ms);
+		/* Command interpretation and acknowledgements are never suspended. */
+		RadioBridge_Task(g_behavior_telemetry, now_ms);
 
-      // tons of test and debug displays
-//      float acc = g_behavior_telemetry->ekf_acceleration_m_s2;
-//      float alt = g_behavior_telemetry->ekf_altitude_m;
-//      float vel = g_behavior_telemetry->ekf_velocity_m_s;
-//
-//      printf("Acceleration: %f \n", acc);
-//      printf("Altitude: %f \n", alt);
-//      printf("Velocity: %f \n", vel);
-//
-//      RocketSensorRawData_t rawd = g_behavior_telemetry->raw;
-//      printf("imu Raw value x gyro: %f \n", rawd.imu[0]);
-//      printf("imu Raw value y gyro: %f \n",rawd.imu[1]);
-//      printf("imu Raw value y gyro: %f \n", rawd.imu[2]);
-//      printf("imu Raw value x: %f g \n", rawd.imu[3]);
-//      printf("imu Raw value y: %f g \n", rawd.imu[4]);
-//      printf("imu Raw value z: %f g \n", rawd.imu[5]);
-//      //printf("baro Raw value 1: %f \n", rawd.baro[0]);
-//      //printf("baro Raw value 2: %f \n", rawd.baro[1]);
-//      // mag y+ == z+
-//      //
-//      printf("mag Raw value x: %f \n", rawd.mag[0]);
-//      printf("mag Raw value y: %f \n", rawd.mag[2]);
-//      printf("mag Raw value z: %f \n", rawd.mag[0]);
+		// tons of test and debug displays
+  //      float acc = g_behavior_telemetry->ekf_acceleration_m_s2;
+  //      float alt = g_behavior_telemetry->ekf_altitude_m;
+  //      float vel = g_behavior_telemetry->ekf_velocity_m_s;
+  //
+  //      printf("Acceleration: %f \n", acc);
+  //      printf("Altitude: %f \n", alt);
+  //      printf("Velocity: %f \n", vel);
+  //
+  //      RocketSensorRawData_t rawd = g_behavior_telemetry->raw;
+  //      printf("imu Raw value x gyro: %f \n", rawd.imu[0]);
+  //      printf("imu Raw value y gyro: %f \n",rawd.imu[1]);
+  //      printf("imu Raw value y gyro: %f \n", rawd.imu[2]);
+  //      printf("imu Raw value x: %f g \n", rawd.imu[3]);
+  //      printf("imu Raw value y: %f g \n", rawd.imu[4]);
+  //      printf("imu Raw value z: %f g \n", rawd.imu[5]);
+  //      //printf("baro Raw value 1: %f \n", rawd.baro[0]);
+  //      //printf("baro Raw value 2: %f \n", rawd.baro[1]);
+  //      // mag y+ == z+
+  //      //
+  //      printf("mag Raw value x: %f \n", rawd.mag[0]);
+  //      printf("mag Raw value y: %f \n", rawd.mag[2]);
+  //      printf("mag Raw value z: %f \n", rawd.mag[0]);
 
-//      position.altitude_agl = openrocket_run_samples[step].altitude_m;
-//      position.vertical_acceleration = openrocket_run_samples[step].acceleration_mps2;
-//      position.vertical_velocity = openrocket_run_samples[step].velocity_mps;
-//
-//      float deploy = Controller_NewDeployment(&cont, position, 1.0/100);
-//
-//      step ++;
-//
-//      printf("deployment: %f \n",deploy);
-//
-//      Airbrake_Update(now_ms);
-//      Airbrake_SetTargetPercent((uint8_t) (deploy * 100));
+  //      position.altitude_agl = openrocket_run_samples[step].altitude_m;
+  //      position.vertical_acceleration = openrocket_run_samples[step].acceleration_mps2;
+  //      position.vertical_velocity = openrocket_run_samples[step].velocity_mps;
+  //
+  //      float deploy = Controller_NewDeployment(&cont, position, 1.0/100);
+  //
+  //      step ++;
+  //
+  //      printf("deployment: %f \n",deploy);
+  //
+  //      Airbrake_Update(now_ms);
+  //      Airbrake_SetTargetPercent((uint8_t) (deploy * 100));
 
-      // delay is needed for tests, but comment out
-      HAL_Delay(10u);
-      // airbrake actuation happens inside behavior
+		// delay is needed for tests, but comment out
+		//HAL_Delay(10u);
+		// airbrake actuation happens inside behavior
 
-      // don't touch anything else, it's auto-generated
+		/*
+		 * USBX standalone-mode scheduler.
+		 *
+		 * This must run continuously so that USB enumeration,
+		 * CDC transfers, and USBX class processing can progress.
+		 */
+		ux_system_tasks_run();
 
+		// don't touch anything else, it's auto-generated
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }

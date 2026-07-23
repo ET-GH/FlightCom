@@ -35,18 +35,19 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Middlewares/ST/usbx/ports/generic/inc/ux_port.h ../USBX/App/ux_user.h \
  ../Middlewares/ST/usbx/common/core/inc/ux_utility.h \
  ../Middlewares/ST/usbx/common/core/inc/ux_system.h \
- ../USBX/App/app_usbx_device.h \
- ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_hid.h \
+ ../USBX/App/app_usbx_device.h ../USBX/App/ux_device_cdc_acm.h \
+ ../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_cdc_acm.h \
+ ../USBX/App/ux_device_descriptors.h ../USBX/Target/ux_stm32_config.h \
  ../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h \
- ../USBX/Target/ux_stm32_config.h ../Core/Inc/radio_bridge.h \
- ../Core/Inc/main.h ../Core/Inc/behavior.h ../Core/Inc/altitude_ekf.h \
- ../Core/Inc/rocket_sensors.h ../Core/Inc/lsm6dsv32x.h \
- ../Core/Inc/lis2mdl.h ../Core/Inc/bmp388.h ../Core/Inc/Fusion/Fusion.h \
- ../Core/Inc/Fusion/FusionAhrs.h ../Core/Inc/Fusion/FusionConvention.h \
- ../Core/Inc/Fusion/FusionMath.h ../Core/Inc/Fusion/FusionBias.h \
- ../Core/Inc/Fusion/FusionCompass.h ../Core/Inc/Fusion/FusionModel.h \
- ../Core/Inc/Fusion/FusionRemap.h ../Core/Inc/rocket_protocol.h \
- ../Core/Inc/airbrake.h ../Core/Inc/behavior.h
+ ../Core/Inc/radio_bridge.h ../Core/Inc/main.h ../Core/Inc/behavior.h \
+ ../Core/Inc/altitude_ekf.h ../Core/Inc/rocket_sensors.h \
+ ../Core/Inc/lsm6dsv32x.h ../Core/Inc/lis2mdl.h ../Core/Inc/bmp388.h \
+ ../Core/Inc/Fusion/Fusion.h ../Core/Inc/Fusion/FusionAhrs.h \
+ ../Core/Inc/Fusion/FusionConvention.h ../Core/Inc/Fusion/FusionMath.h \
+ ../Core/Inc/Fusion/FusionBias.h ../Core/Inc/Fusion/FusionCompass.h \
+ ../Core/Inc/Fusion/FusionModel.h ../Core/Inc/Fusion/FusionRemap.h \
+ ../Core/Inc/rocket_protocol.h ../Core/Inc/airbrake.h \
+ ../Core/Inc/behavior.h
 ../Core/Inc/main.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
 ../Core/Inc/stm32h5xx_hal_conf.h:
@@ -87,9 +88,11 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Middlewares/ST/usbx/common/core/inc/ux_utility.h:
 ../Middlewares/ST/usbx/common/core/inc/ux_system.h:
 ../USBX/App/app_usbx_device.h:
-../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_hid.h:
-../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h:
+../USBX/App/ux_device_cdc_acm.h:
+../Middlewares/ST/usbx/common/usbx_device_classes/inc/ux_device_class_cdc_acm.h:
+../USBX/App/ux_device_descriptors.h:
 ../USBX/Target/ux_stm32_config.h:
+../Middlewares/ST/usbx/common/usbx_stm32_device_controllers/ux_dcd_stm32.h:
 ../Core/Inc/radio_bridge.h:
 ../Core/Inc/main.h:
 ../Core/Inc/behavior.h:

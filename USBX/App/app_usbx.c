@@ -110,7 +110,7 @@ ULONG _ux_utility_time_get(VOID)
   ULONG time_tick = 0U;
 
   /* USER CODE BEGIN _ux_utility_time_get */
-
+  time_tick = (ULONG)HAL_GetTick();
   /* USER CODE END _ux_utility_time_get */
 
   return time_tick;
