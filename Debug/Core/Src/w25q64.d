@@ -30,7 +30,8 @@ Core/Src/w25q64.o: ../Core/Src/w25q64.c ../Core/Inc/w25q64.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_usb.h \
  ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd_ex.h \
- ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h
+ ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h \
+ ../Core/Inc/rocket_protocol.h
 ../Core/Inc/w25q64.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
 ../Core/Inc/stm32h5xx_hal_conf.h:
@@ -64,3 +65,4 @@ Core/Src/w25q64.o: ../Core/Src/w25q64.c ../Core/Inc/w25q64.h \
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_ll_usb.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_pcd_ex.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal_exti.h:
+../Core/Inc/rocket_protocol.h:

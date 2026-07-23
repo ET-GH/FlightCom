@@ -47,7 +47,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Core/Inc/Fusion/FusionBias.h ../Core/Inc/Fusion/FusionCompass.h \
  ../Core/Inc/Fusion/FusionModel.h ../Core/Inc/Fusion/FusionRemap.h \
  ../Core/Inc/rocket_protocol.h ../Core/Inc/airbrake.h \
- ../Core/Inc/usb_comm.h ../Core/Inc/ambar_hil_usb.h \
+ ../Core/Inc/w25q64.h ../Core/Inc/usb_comm.h ../Core/Inc/ambar_hil_usb.h \
  ../Core/Inc/behavior.h
 ../Core/Inc/main.h:
 ../Drivers/STM32H5xx_HAL_Driver/Inc/stm32h5xx_hal.h:
@@ -112,6 +112,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/Fusion/FusionRemap.h:
 ../Core/Inc/rocket_protocol.h:
 ../Core/Inc/airbrake.h:
+../Core/Inc/w25q64.h:
 ../Core/Inc/usb_comm.h:
 ../Core/Inc/ambar_hil_usb.h:
 ../Core/Inc/behavior.h:

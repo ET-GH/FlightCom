@@ -235,44 +235,104 @@ static W25Q64_Result_t W25Q64_FromHAL(HAL_StatusTypeDef status)
     return W25Q64_ERROR;
 }
 
-static W25Q64_Result_t W25Q64_Tx(W25Q64_HandleTypeDef *dev,
-                                 const uint8_t *data,
-                                 uint16_t length)
+#define W25Q64_TRANSFER_CHUNK_SIZE 32U
+
+static W25Q64_Result_t W25Q64_Tx(
+    W25Q64_HandleTypeDef *dev,
+    const uint8_t *data,
+    uint16_t length)
 {
+    uint8_t discarded_rx[W25Q64_TRANSFER_CHUNK_SIZE];
+
     const uint32_t timeout =
-        W25Q64_TimeoutOrDefault(dev->spi_timeout_ms,
-                               W25Q64_DEFAULT_SPI_TIMEOUT_MS);
+        W25Q64_TimeoutOrDefault(
+            dev->spi_timeout_ms,
+            W25Q64_DEFAULT_SPI_TIMEOUT_MS);
 
     if ((data == NULL) && (length != 0U))
     {
         return W25Q64_INVALID_ARGUMENT;
     }
 
-    return W25Q64_FromHAL(
-        HAL_SPI_Transmit(dev->hspi,
-                         (uint8_t *)data,
-                         length,
-                         timeout));
+    while (length != 0U)
+    {
+        HAL_StatusTypeDef hal_status;
+
+        const uint16_t chunk =
+            (length > W25Q64_TRANSFER_CHUNK_SIZE)
+                ? W25Q64_TRANSFER_CHUNK_SIZE
+                : length;
+
+        hal_status =
+            HAL_SPI_TransmitReceive(
+                dev->hspi,
+                (uint8_t *)data,
+                discarded_rx,
+                chunk,
+                timeout);
+
+        if (hal_status != HAL_OK)
+        {
+            return W25Q64_FromHAL(hal_status);
+        }
+
+        data += chunk;
+        length -= chunk;
+    }
+
+    return W25Q64_OK;
 }
 
-static W25Q64_Result_t W25Q64_Rx(W25Q64_HandleTypeDef *dev,
-                                 uint8_t *data,
-                                 uint16_t length)
+static W25Q64_Result_t W25Q64_Rx(
+    W25Q64_HandleTypeDef *dev,
+    uint8_t *data,
+    uint16_t length)
 {
+    uint8_t dummy_tx[W25Q64_TRANSFER_CHUNK_SIZE];
+
     const uint32_t timeout =
-        W25Q64_TimeoutOrDefault(dev->spi_timeout_ms,
-                               W25Q64_DEFAULT_SPI_TIMEOUT_MS);
+        W25Q64_TimeoutOrDefault(
+            dev->spi_timeout_ms,
+            W25Q64_DEFAULT_SPI_TIMEOUT_MS);
 
     if ((data == NULL) && (length != 0U))
     {
         return W25Q64_INVALID_ARGUMENT;
     }
 
-    return W25Q64_FromHAL(
-        HAL_SPI_Receive(dev->hspi,
-                        data,
-                        length,
-                        timeout));
+    memset(dummy_tx, 0xFF, sizeof(dummy_tx));
+
+    while (length != 0U)
+    {
+        HAL_StatusTypeDef hal_status;
+
+        const uint16_t chunk =
+            (length > W25Q64_TRANSFER_CHUNK_SIZE)
+                ? W25Q64_TRANSFER_CHUNK_SIZE
+                : length;
+
+        /*
+         * SPI reads require the master to transmit dummy bytes so that
+         * clock pulses are generated for the flash response.
+         */
+        hal_status =
+            HAL_SPI_TransmitReceive(
+                dev->hspi,
+                dummy_tx,
+                data,
+                chunk,
+                timeout);
+
+        if (hal_status != HAL_OK)
+        {
+            return W25Q64_FromHAL(hal_status);
+        }
+
+        data += chunk;
+        length -= chunk;
+    }
+
+    return W25Q64_OK;
 }
 
 static W25Q64_Result_t W25Q64_CommandOnly(W25Q64_HandleTypeDef *dev,
