@@ -261,11 +261,11 @@ uint16_t USBD_Get_Configuration_Number(uint8_t class_type, uint8_t interface_typ
 /* USER CODE END Private_defines */
 
 #define USBD_VID                                      1155
-#define USBD_PID                                      22288
+#define USBD_PID                                      22336
 #define USBD_LANGID_STRING                            1033
 #define USBD_MANUFACTURER_STRING                      "STMicroelectronics"
-#define USBD_PRODUCT_STRING                           "STM32 HID Test"
-#define USBD_SERIAL_NUMBER                            "000000000001"
+#define USBD_PRODUCT_STRING                           "AMBAR Flight Computer"
+#define USBD_SERIAL_NUMBER                            "AMBARFC0001"
 
 #define USB_DESC_TYPE_INTERFACE                       0x04U
 #define USB_DESC_TYPE_ENDPOINT                        0x05U
@@ -293,11 +293,11 @@ uint16_t USBD_Get_Configuration_Number(uint8_t class_type, uint8_t interface_typ
 #define USBD_STRING_FRAMEWORK_MAX_LENGTH              256U
 
 /* Device CDC-ACM Class */
-#define USBD_CDCACM_EPINCMD_ADDR                      0x81U
+#define USBD_CDCACM_EPINCMD_ADDR                      0x82U
 #define USBD_CDCACM_EPINCMD_FS_MPS                    8U
 #define USBD_CDCACM_EPINCMD_HS_MPS                    8U
-#define USBD_CDCACM_EPIN_ADDR                         0x82U
-#define USBD_CDCACM_EPOUT_ADDR                        0x03U
+#define USBD_CDCACM_EPIN_ADDR                         0x81U
+#define USBD_CDCACM_EPOUT_ADDR                        0x01U
 #define USBD_CDCACM_EPIN_FS_MPS                       64U
 #define USBD_CDCACM_EPIN_HS_MPS                       512U
 #define USBD_CDCACM_EPOUT_FS_MPS                      64U

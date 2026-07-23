@@ -86,17 +86,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* hi2c)
   if(hi2c->Instance==I2C1)
   {
     /* USER CODE BEGIN I2C1_MspInit 0 */
-	  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-	  __HAL_RCC_GPIOA_CLK_ENABLE();
-
-	  /* PA11 = USB_DM, PA12 = USB_DP */
-	  GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_12;
-	  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-	  GPIO_InitStruct.Pull = GPIO_NOPULL;
-	  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-	  GPIO_InitStruct.Alternate = GPIO_AF10_USB;   // If undefined, check stm32h5xx_hal_gpio_ex.h for the USB AF name
-	  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
     /* USER CODE END I2C1_MspInit 0 */
 
   /** Initializes the peripherals clock

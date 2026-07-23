@@ -998,6 +998,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_CRSInitTypeDef RCC_CRSInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
   */
@@ -1041,6 +1042,21 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
+  /** Enable the CRS APB clock
+  */
+  __HAL_RCC_CRS_CLK_ENABLE();
+
+  /** Configures CRS
+  */
+  RCC_CRSInitStruct.Prescaler = RCC_CRS_SYNC_DIV1;
+  RCC_CRSInitStruct.Source = RCC_CRS_SYNC_SOURCE_USB;
+  RCC_CRSInitStruct.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  RCC_CRSInitStruct.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000,1000);
+  RCC_CRSInitStruct.ErrorLimitValue = 34;
+  RCC_CRSInitStruct.HSI48CalibrationValue = 32;
+
+  HAL_RCCEx_CRSConfig(&RCC_CRSInitStruct);
 
   /** Configure the programming delay
   */
@@ -1398,7 +1414,36 @@ void MX_USB_PCD_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USB_Init 2 */
+  /*
+   * USB_DRD_FS packet-memory allocation.
+   *
+   * dev_endpoints is 8, so the PMA buffer area begins after the
+   * eight-entry endpoint buffer table.
+   */
+  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS,
+                      0x00U,
+                      PCD_SNG_BUF,
+                      0x20U);  /* EP0 OUT, 64 bytes */
 
+  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS,
+                      0x80U,
+                      PCD_SNG_BUF,
+                      0x60U);  /* EP0 IN, 64 bytes */
+
+  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS,
+                      0x81U,
+                      PCD_SNG_BUF,
+                      0xA0U);  /* CDC bulk IN */
+
+  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS,
+                      0x01U,
+                      PCD_SNG_BUF,
+                      0xE0U);  /* CDC bulk OUT */
+
+  HAL_PCDEx_PMAConfig(&hpcd_USB_DRD_FS,
+                      0x82U,
+                      PCD_SNG_BUF,
+                      0x120U); /* CDC notification IN */
   /* USER CODE END USB_Init 2 */
 
 }
