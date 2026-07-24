@@ -67,6 +67,22 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+/*
+ * Command-driven USB archive export state.
+ *
+ * USB enumeration and PING remain available in every state. Flash records are
+ * transmitted only after the host sends AMBAR_HIL_USB_COMMAND_EXPORT_LOG.
+ */
+typedef enum
+{
+    MEMORY_EXPORT_IDLE = 0,
+    MEMORY_EXPORT_BEGIN_PENDING,
+    MEMORY_EXPORT_SENDING,
+    MEMORY_EXPORT_COMPLETE_PENDING,
+    MEMORY_EXPORT_CANCEL_PENDING,
+    MEMORY_EXPORT_ERROR_PENDING
+} MemoryExportState_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -94,6 +110,31 @@
 #define MEMORY_ARCHIVE_DELTA_QUANTUM_MS      10U
 #define MEMORY_ARCHIVE_EVENT_FLAG            0x8000U
 #define MEMORY_ARCHIVE_EVENT_DELTA_MASK      0x7FFFU
+
+
+/*
+ * Archive-transfer control events.
+ *
+ * These are ordinary (non-archived) EVENT packets, so the GroundStation can
+ * use them to determine the exact record count and transfer completion without
+ * writing protocol-control rows into the exported flight CSV.
+ *
+ * EVENT layout for these two message codes:
+ *   changed_flags  = record count bits 0..15
+ *   current_flags  = record count bits 16..31
+ *   previous_state = control-envelope version
+ *   current_state  = transfer result
+ */
+#define MEMORY_ARCHIVE_CONTROL_BEGIN         0xF0U
+#define MEMORY_ARCHIVE_CONTROL_END           0xF1U
+#define MEMORY_ARCHIVE_CONTROL_VERSION       1U
+#define MEMORY_ARCHIVE_RESULT_OK             0U
+#define MEMORY_ARCHIVE_RESULT_FLASH_ERROR    1U
+#define MEMORY_ARCHIVE_RESULT_READ_ERROR     2U
+#define MEMORY_EXPORT_PHASE_IDLE             0U
+#define MEMORY_EXPORT_PHASE_BEGIN            1U
+#define MEMORY_EXPORT_PHASE_RECORDS          2U
+#define MEMORY_EXPORT_PHASE_END              3U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -143,6 +184,7 @@ volatile bool g_measurement_updates_enabled = true;
  */
 volatile bool g_airbrakes_enabled = true;
 
+
 /* ------------------------------------------------------------------------- */
 /* External W25Q64JV flash and Rocket Protocol archive diagnostics            */
 /* ------------------------------------------------------------------------- */
@@ -169,6 +211,9 @@ volatile bool g_memory_export_active = false;
 volatile bool g_request_memory_log_erase = false;
 
 static uint32_t g_memory_last_log_ms = 0U;
+static MemoryExportState_t g_memory_export_state = MEMORY_EXPORT_IDLE;
+static uint16_t g_memory_export_command_sequence = 0U;
+static uint8_t g_memory_export_error_code = 0U;
 static bool g_memory_usb_was_connected = false;
 static bool g_memory_export_record_loaded = false;
 static uint32_t g_memory_export_index = 0U;
@@ -178,6 +223,9 @@ static uint32_t g_memory_export_previous_time_ms = 0U;
 static uint8_t g_memory_export_packet_type = ROCKET_PKT_TELEMETRY;
 static RocketTelemetryPayload g_memory_export_payload;
 static RocketEventPayload g_memory_export_event;
+
+static uint8_t g_memory_export_phase = MEMORY_EXPORT_PHASE_IDLE;
+static uint8_t g_memory_export_result = MEMORY_ARCHIVE_RESULT_OK;
 
 /* Previous archived state used to create event records at their exact time. */
 static bool g_memory_event_state_valid = false;
@@ -246,6 +294,8 @@ static void Memory_LogTask(
     bool behavior_updated);
 static void Memory_ExportTask(void);
 static void Memory_ServiceEraseRequest(void);
+static bool Memory_ExportAllowed(void);
+static bool Memory_SendExportStatus(uint8_t state, uint8_t error_code);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -555,6 +605,149 @@ static void Memory_RocketToUsbEvent(
     usb->detail = rocket->detail;
 }
 
+
+/*
+ * Flash export is blocked only during active ascent/coast/descent.
+ *
+ * This still permits retrieval after a reboot, during preflight bench work,
+ * after landing, while in standby, or while flight-computer updates are
+ * disabled. USB PING remains available regardless of this result.
+ */
+static bool Memory_ExportAllowed(void)
+{
+    uint8_t phase;
+
+    if (!g_flight_computer_enabled || !g_measurement_updates_enabled)
+    {
+        return true;
+    }
+
+    if (g_behavior_telemetry == NULL)
+    {
+        return false;
+    }
+
+    phase = (uint8_t)g_behavior_telemetry->flight_phase;
+
+    return (phase != BEHAVIOR_FLIGHT_PHASE_POWERED_ASCENT) &&
+           (phase != BEHAVIOR_FLIGHT_PHASE_COAST) &&
+           (phase != BEHAVIOR_FLIGHT_PHASE_DESCENT);
+}
+
+/*
+ * Queue one explicit archive-transfer status packet.
+ *
+ * The host uses STARTED.total_records for the progress-bar maximum and uses
+ * COMPLETE/CANCELLED/ERROR instead of guessing completion from a timeout.
+ */
+static bool Memory_SendExportStatus(uint8_t state, uint8_t error_code)
+{
+    AmbarHilUsbLogStatus status;
+
+    memset(&status, 0, sizeof(status));
+    status.command_sequence = g_memory_export_command_sequence;
+    status.state = state;
+    status.error_code = error_code;
+    status.total_records = g_memory_export_total;
+    status.records_sent = g_memory_exported_records;
+    status.corrupt_records = W25Q64_LogGetCorruptCount();
+
+    return USBComm_SendLogStatus(&status);
+}
+
+/*
+ * Strong implementation of the weak application callback in usb_comm.c.
+ *
+ * The USB transport validates framing and payload extraction. This callback
+ * owns only the application policy and state transition.
+ */
+uint8_t USBComm_ExecuteCommand(
+    uint8_t command,
+    const uint8_t *payload,
+    uint8_t payload_length,
+    uint16_t command_sequence,
+    uint16_t *detail)
+{
+    (void)payload;
+
+    if (detail == NULL)
+    {
+        return AMBAR_HIL_USB_ACK_EXECUTION_ERROR;
+    }
+
+    *detail = 0U;
+
+    switch (command)
+    {
+        case AMBAR_HIL_USB_COMMAND_EXPORT_LOG:
+        {
+            if (payload_length != 0U)
+            {
+                return AMBAR_HIL_USB_ACK_BAD_LENGTH;
+            }
+
+            if (g_memory_flash_init_result != W25Q64_OK)
+            {
+                return AMBAR_HIL_USB_ACK_EXECUTION_ERROR;
+            }
+
+            if (g_memory_export_state != MEMORY_EXPORT_IDLE)
+            {
+                return AMBAR_HIL_USB_ACK_BUSY;
+            }
+
+            if (!Memory_ExportAllowed())
+            {
+                return AMBAR_HIL_USB_ACK_BUSY;
+            }
+
+            /*
+             * Freeze the record total at command acceptance. Memory_LogTask()
+             * sees the non-idle state before the next append opportunity.
+             */
+            g_memory_export_command_sequence = command_sequence;
+            g_memory_export_index = 0U;
+            g_memory_export_total = W25Q64_LogGetCount();
+            g_memory_export_previous_time_ms = 0U;
+            g_memory_exported_records = 0U;
+            g_memory_export_record_loaded = false;
+            g_memory_export_error_code = 0U;
+            g_memory_export_active = true;
+            g_memory_export_state = MEMORY_EXPORT_BEGIN_PENDING;
+
+            *detail = (g_memory_export_total > 65535U)
+                ? 65535U
+                : (uint16_t)g_memory_export_total;
+
+            return AMBAR_HIL_USB_ACK_OK;
+        }
+
+        case AMBAR_HIL_USB_COMMAND_CANCEL_EXPORT:
+        {
+            if (payload_length != 0U)
+            {
+                return AMBAR_HIL_USB_ACK_BAD_LENGTH;
+            }
+
+            if (g_memory_export_state == MEMORY_EXPORT_IDLE)
+            {
+                return AMBAR_HIL_USB_ACK_BAD_VALUE;
+            }
+
+            g_memory_export_state = MEMORY_EXPORT_CANCEL_PENDING;
+
+            *detail = (g_memory_exported_records > 65535U)
+                ? 65535U
+                : (uint16_t)g_memory_exported_records;
+
+            return AMBAR_HIL_USB_ACK_OK;
+        }
+
+        default:
+            return AMBAR_HIL_USB_ACK_UNSUPPORTED;
+    }
+}
+
 /**
  * Detect events every behavior iteration and store telemetry every 250 ms.
  * Event timestamps therefore are not rounded to the telemetry interval.
@@ -570,7 +763,7 @@ static void Memory_LogTask(
         (telemetry != NULL) &&
         (g_memory_flash_init_result == W25Q64_OK) &&
         W25Q64_LogCanAppend() &&
-        !USBComm_IsConnected();
+        (g_memory_export_state == MEMORY_EXPORT_IDLE);
 
     if (!ready || !Memory_BuildRocketTelemetry(telemetry, &sample))
     {
@@ -652,13 +845,50 @@ static void Memory_LogTask(
     g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
 }
 
+
 /**
- * Replay telemetry and event records once per physical USB connection.
+ * Queue a transfer-control EVENT without the archive marker.
+ *
+ * Because detail bit 15 is clear, AmbarUsbClient::startArchiveCsv() filters this
+ * packet out of the CSV while RawImportController can still inspect it through
+ * packetReceived(). This keeps the CSV limited to actual flash records.
+ */
+static bool Memory_SendArchiveControl(uint8_t message_code,
+                                      uint32_t record_count,
+                                      uint8_t result_code)
+{
+    AmbarHilUsbEvent control;
+
+    memset(&control, 0, sizeof(control));
+    control.changed_flags =
+        (uint16_t)(record_count & 0xFFFFUL);
+    control.current_flags =
+        (uint16_t)((record_count >> 16) & 0xFFFFUL);
+    control.previous_state = MEMORY_ARCHIVE_CONTROL_VERSION;
+    control.current_state = result_code;
+    control.status_code =
+        (result_code == MEMORY_ARCHIVE_RESULT_OK)
+            ? ROCKET_STATUS_OK
+            : ROCKET_STATUS_UNKNOWN;
+    control.message_code = message_code;
+
+    /*
+     * Keep the archive marker clear. The packet is transfer metadata, not a
+     * stored flight event, and therefore must not become a CSV row.
+     */
+    control.detail = 0U;
+
+    return USBComm_SendEvent(&control);
+}
+
+/**
+ * Replay telemetry and event records only after an EXPORT_LOG USB command.
  *
  * Telemetry uses reserved bit 7 plus a 10 ms delta, as before. Archived events
  * use detail bit 15 plus a 10 ms delta. The generated flash events currently
  * store detail=0, so no event information is lost by this USB convention.
  */
+
 static void Memory_ExportTask(void)
 {
     const bool connected = USBComm_IsConnected();
@@ -668,6 +898,8 @@ static void Memory_ExportTask(void)
         g_memory_usb_was_connected = false;
         g_memory_export_active = false;
         g_memory_export_record_loaded = false;
+        g_memory_export_phase = MEMORY_EXPORT_PHASE_IDLE;
+        g_memory_export_result = MEMORY_ARCHIVE_RESULT_OK;
         return;
     }
 
@@ -675,13 +907,19 @@ static void Memory_ExportTask(void)
     {
         g_memory_usb_was_connected = true;
         g_memory_export_index = 0U;
-        g_memory_export_total = W25Q64_LogGetCount();
+        g_memory_export_total =
+            (g_memory_flash_init_result == W25Q64_OK)
+                ? W25Q64_LogGetCount()
+                : 0U;
         g_memory_export_previous_time_ms = 0U;
         g_memory_exported_records = 0U;
         g_memory_export_record_loaded = false;
-        g_memory_export_active =
-            (g_memory_flash_init_result == W25Q64_OK) &&
-            (g_memory_export_total != 0U);
+        g_memory_export_result =
+            (g_memory_flash_init_result == W25Q64_OK)
+                ? MEMORY_ARCHIVE_RESULT_OK
+                : MEMORY_ARCHIVE_RESULT_FLASH_ERROR;
+        g_memory_export_phase = MEMORY_EXPORT_PHASE_BEGIN;
+        g_memory_export_active = true;
     }
 
     if (!g_memory_export_active)
@@ -689,95 +927,148 @@ static void Memory_ExportTask(void)
         return;
     }
 
-    if (!g_memory_export_record_loaded)
+    /*
+     * Send the total record count before the first archived row. Queue pressure
+     * is handled by retrying this phase on the next cooperative-loop iteration.
+     */
+    if (g_memory_export_phase == MEMORY_EXPORT_PHASE_BEGIN)
     {
-        g_memory_log_result =
-            W25Q64_LogReadRecord(&g_memory_flash,
-                                 g_memory_export_index,
-                                 &g_memory_export_record_time_ms,
-                                 &g_memory_export_packet_type,
-                                 &g_memory_export_payload,
-                                 &g_memory_export_event);
-
-        if (g_memory_log_result != W25Q64_OK)
+        if (Memory_SendArchiveControl(MEMORY_ARCHIVE_CONTROL_BEGIN,
+                                      g_memory_export_total,
+                                      g_memory_export_result))
         {
-            ++g_memory_export_read_failures;
-            g_memory_export_active = false;
-            g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
-            return;
+            g_memory_export_phase =
+                ((g_memory_export_result == MEMORY_ARCHIVE_RESULT_OK) &&
+                 (g_memory_export_total != 0U))
+                    ? MEMORY_EXPORT_PHASE_RECORDS
+                    : MEMORY_EXPORT_PHASE_END;
         }
 
-        g_memory_export_record_loaded = true;
+        return;
     }
 
+    if (g_memory_export_phase == MEMORY_EXPORT_PHASE_RECORDS)
     {
-        uint32_t delta_ms = 0U;
-        uint32_t delta_units = 0U;
-        bool queued = false;
-
-        if (g_memory_export_index != 0U)
+        if (!g_memory_export_record_loaded)
         {
-            delta_ms =
-                g_memory_export_record_time_ms -
-                g_memory_export_previous_time_ms;
-            delta_units =
-                (delta_ms + (MEMORY_ARCHIVE_DELTA_QUANTUM_MS / 2U)) /
-                MEMORY_ARCHIVE_DELTA_QUANTUM_MS;
-        }
+            g_memory_log_result =
+                W25Q64_LogReadRecord(&g_memory_flash,
+                                     g_memory_export_index,
+                                     &g_memory_export_record_time_ms,
+                                     &g_memory_export_packet_type,
+                                     &g_memory_export_payload,
+                                     &g_memory_export_event);
 
-        if (g_memory_export_packet_type == ROCKET_PKT_TELEMETRY)
-        {
-            AmbarHilUsbTelemetry usb_payload;
-
-            Memory_RocketToUsbTelemetry(&g_memory_export_payload,
-                                        &usb_payload);
-
-            if (delta_units > MEMORY_ARCHIVE_DELTA_MASK)
+            if (g_memory_log_result != W25Q64_OK)
             {
-                delta_units = MEMORY_ARCHIVE_DELTA_MASK;
+                ++g_memory_export_read_failures;
+                g_memory_log_corrupt_records =
+                    W25Q64_LogGetCorruptCount();
+                g_memory_export_result =
+                    MEMORY_ARCHIVE_RESULT_READ_ERROR;
+                g_memory_export_record_loaded = false;
+                g_memory_export_phase = MEMORY_EXPORT_PHASE_END;
+                return;
             }
 
-            usb_payload.reserved =
-                (uint8_t)(MEMORY_ARCHIVE_FLAG |
-                          (uint8_t)delta_units);
-            queued = USBComm_SendTelemetry(&usb_payload);
+            g_memory_export_record_loaded = true;
         }
-        else if (g_memory_export_packet_type == ROCKET_PKT_EVENT)
+
         {
-            AmbarHilUsbEvent usb_event;
+            uint32_t delta_ms = 0U;
+            uint32_t delta_units = 0U;
+            bool queued = false;
 
-            Memory_RocketToUsbEvent(&g_memory_export_event,
-                                    &usb_event);
-
-            if (delta_units > MEMORY_ARCHIVE_EVENT_DELTA_MASK)
+            if (g_memory_export_index != 0U)
             {
-                delta_units = MEMORY_ARCHIVE_EVENT_DELTA_MASK;
+                delta_ms =
+                    g_memory_export_record_time_ms -
+                    g_memory_export_previous_time_ms;
+                delta_units =
+                    (delta_ms +
+                     (MEMORY_ARCHIVE_DELTA_QUANTUM_MS / 2U)) /
+                    MEMORY_ARCHIVE_DELTA_QUANTUM_MS;
             }
 
-            usb_event.detail =
-                (uint16_t)(MEMORY_ARCHIVE_EVENT_FLAG |
-                           (uint16_t)delta_units);
-            queued = USBComm_SendEvent(&usb_event);
+            if (g_memory_export_packet_type == ROCKET_PKT_TELEMETRY)
+            {
+                AmbarHilUsbTelemetry usb_payload;
+
+                Memory_RocketToUsbTelemetry(
+                    &g_memory_export_payload,
+                    &usb_payload);
+
+                if (delta_units > MEMORY_ARCHIVE_DELTA_MASK)
+                {
+                    delta_units = MEMORY_ARCHIVE_DELTA_MASK;
+                }
+
+                usb_payload.reserved =
+                    (uint8_t)(MEMORY_ARCHIVE_FLAG |
+                              (uint8_t)delta_units);
+                queued = USBComm_SendTelemetry(&usb_payload);
+            }
+            else if (g_memory_export_packet_type == ROCKET_PKT_EVENT)
+            {
+                AmbarHilUsbEvent usb_event;
+
+                Memory_RocketToUsbEvent(
+                    &g_memory_export_event,
+                    &usb_event);
+
+                if (delta_units > MEMORY_ARCHIVE_EVENT_DELTA_MASK)
+                {
+                    delta_units =
+                        MEMORY_ARCHIVE_EVENT_DELTA_MASK;
+                }
+
+                usb_event.detail =
+                    (uint16_t)(MEMORY_ARCHIVE_EVENT_FLAG |
+                               (uint16_t)delta_units);
+                queued = USBComm_SendEvent(&usb_event);
+            }
+            else
+            {
+                ++g_memory_export_read_failures;
+                g_memory_export_result =
+                    MEMORY_ARCHIVE_RESULT_READ_ERROR;
+                g_memory_export_record_loaded = false;
+                g_memory_export_phase = MEMORY_EXPORT_PHASE_END;
+                return;
+            }
+
+            if (queued)
+            {
+                g_memory_export_previous_time_ms =
+                    g_memory_export_record_time_ms;
+                ++g_memory_export_index;
+                ++g_memory_exported_records;
+                g_memory_export_record_loaded = false;
+
+                if (g_memory_export_index >=
+                    g_memory_export_total)
+                {
+                    g_memory_export_phase =
+                        MEMORY_EXPORT_PHASE_END;
+                }
+            }
         }
-        else
+
+        return;
+    }
+
+    /*
+     * Send an explicit terminal count/result. The GroundStation closes the CSV
+     * and loads the analysis graphs only after receiving this packet.
+     */
+    if (g_memory_export_phase == MEMORY_EXPORT_PHASE_END)
+    {
+        if (Memory_SendArchiveControl(MEMORY_ARCHIVE_CONTROL_END,
+                                      g_memory_exported_records,
+                                      g_memory_export_result))
         {
-            ++g_memory_export_read_failures;
+            g_memory_export_phase = MEMORY_EXPORT_PHASE_IDLE;
             g_memory_export_active = false;
-            return;
-        }
-
-        if (queued)
-        {
-            g_memory_export_previous_time_ms =
-                g_memory_export_record_time_ms;
-            ++g_memory_export_index;
-            ++g_memory_exported_records;
-            g_memory_export_record_loaded = false;
-
-            if (g_memory_export_index >= g_memory_export_total)
-            {
-                g_memory_export_active = false;
-            }
         }
     }
 }
@@ -1672,7 +1963,10 @@ int main(void)
 		 */
 		USBComm_Task();
 
-		/* On each new physical connection, replay the complete archive once. */
+		/*
+		 * Replay flash only after an accepted EXPORT_LOG USB command.
+		 * Physical connection and PING alone never start archive transmission.
+		 */
 		Memory_ExportTask();
 
 		// don't touch anything else, it's auto-generated

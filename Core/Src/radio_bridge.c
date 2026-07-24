@@ -618,6 +618,7 @@ static uint8_t RadioBridge_ValidateCommand(
         case ROCKET_CMD_REQUEST_SNAPSHOT:
         case ROCKET_CMD_RETURN_STANDARD:
         case ROCKET_CMD_CLEAR_FAULTS:
+        case ROCKET_CMD_CLEAR_MEMORY:
             return (command->payload_length == 0U)
                 ? ROCKET_ACK_OK
                 : ROCKET_ACK_BAD_LENGTH;
@@ -665,7 +666,7 @@ static uint8_t RadioBridge_ValidateCommand(
             }
             *detail = ((uint32_t)command->payload[0] << 8) |
                       command->payload[1];
-            return ((command->payload[0] <= ROCKET_SUBSYSTEM_FLIGHT_COMPUTER) &&
+            return ((command->payload[0] <= ROCKET_SUBSYSTEM_MEMORY_LOGGING) &&
                     (command->payload[1] <= 1U))
                 ? ROCKET_ACK_OK
                 : ROCKET_ACK_BAD_VALUE;

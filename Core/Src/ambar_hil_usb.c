@@ -910,6 +910,28 @@ static size_t encode_variable_config(uint8_t *out,
     return AMBAR_HIL_USB_VARIABLE_CONFIG_SIZE;
 }
 
+static size_t encode_log_status(
+    uint8_t *out,
+    size_t capacity,
+    const AmbarHilUsbLogStatus *payload)
+{
+    if ((out == NULL) ||
+        (payload == NULL) ||
+        (capacity < AMBAR_HIL_USB_LOG_STATUS_PAYLOAD_SIZE))
+    {
+        return 0u;
+    }
+
+    write_u16(out + 0u, payload->command_sequence);
+    out[2] = payload->state;
+    out[3] = payload->error_code;
+    write_u32(out + 4u, payload->total_records);
+    write_u32(out + 8u, payload->records_sent);
+    write_u32(out + 12u, payload->corrupt_records);
+
+    return AMBAR_HIL_USB_LOG_STATUS_PAYLOAD_SIZE;
+}
+
 bool AmbarHilUsb_Init(AmbarHilUsb *context, const AmbarHilUsbIo *io)
 {
     if (context == NULL
@@ -1151,6 +1173,24 @@ bool AmbarHilUsb_SendHeartbeat(AmbarHilUsb *context,
                                encoded,
                                length,
                                false);
+}
+
+bool AmbarHilUsb_SendLogStatus(
+    AmbarHilUsb *context,
+    const AmbarHilUsbLogStatus *payload)
+{
+    uint8_t encoded[AMBAR_HIL_USB_LOG_STATUS_PAYLOAD_SIZE];
+
+    const size_t length =
+        encode_log_status(encoded, sizeof(encoded), payload);
+
+    return (length != 0u) &&
+           queue_auto_sequence(
+               context,
+               AMBAR_HIL_USB_PACKET_LOG_STATUS,
+               encoded,
+               length,
+               false);
 }
 
 bool AmbarHilUsb_SendVariableHilState(

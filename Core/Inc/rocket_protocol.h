@@ -34,7 +34,8 @@ typedef enum {
     ROCKET_CMD_SET_SUBSYSTEM       = 0x15, /* payload: uint8 subsystem, uint8 0/1 */
     ROCKET_CMD_MOTOR_STEPS         = 0x16, /* payload: int16 signed steps */
     ROCKET_CMD_REQUEST_DIAGNOSTICS = 0x17, /* payload: uint8 diagnostics group */
-    ROCKET_CMD_CLEAR_FAULTS        = 0x18  /* no payload */
+    ROCKET_CMD_CLEAR_FAULTS        = 0x18, /* no payload */
+    ROCKET_CMD_CLEAR_MEMORY        = 0x19  /* no payload */
 } RocketCommandCode;
 
 
@@ -42,7 +43,8 @@ typedef enum {
  * software/arming state; the MCU cannot remove its own electrical power. */
 typedef enum {
     ROCKET_SUBSYSTEM_RADIO           = 0x00,
-    ROCKET_SUBSYSTEM_FLIGHT_COMPUTER = 0x01
+    ROCKET_SUBSYSTEM_FLIGHT_COMPUTER = 0x01,
+    ROCKET_SUBSYSTEM_MEMORY_LOGGING  = 0x02
 } RocketSubsystemId;
 
 /* Values used by ROCKET_CMD_SET_MODE. */
@@ -321,6 +323,7 @@ static inline const char *RocketProtocol_CommandText(uint8_t code) {
         case ROCKET_CMD_MOTOR_STEPS: return "MOTOR_STEPS";
         case ROCKET_CMD_REQUEST_DIAGNOSTICS: return "REQUEST_DIAGNOSTICS";
         case ROCKET_CMD_CLEAR_FAULTS: return "CLEAR_FAULTS";
+        case ROCKET_CMD_CLEAR_MEMORY: return "CLEAR_MEMORY";
         default: return "UNKNOWN_COMMAND";
     }
 }

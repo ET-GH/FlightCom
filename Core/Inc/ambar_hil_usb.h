@@ -87,6 +87,7 @@ extern "C" {
 #define AMBAR_HIL_USB_VARIABLE_STATE_SIZE      44u
 #define AMBAR_HIL_USB_VARIABLE_CONFIG_SIZE     52u
 #define AMBAR_HIL_USB_HEARTBEAT_PAYLOAD_SIZE    8u
+#define AMBAR_HIL_USB_LOG_STATUS_PAYLOAD_SIZE  16u
 
 typedef enum
 {
@@ -98,6 +99,7 @@ typedef enum
     AMBAR_HIL_USB_PACKET_COMMAND = 0x10,
     AMBAR_HIL_USB_PACKET_ACK = 0x11,
     AMBAR_HIL_USB_PACKET_HEARTBEAT = 0x12,
+    AMBAR_HIL_USB_PACKET_LOG_STATUS = 0x13,
     AMBAR_HIL_USB_PACKET_SIMULATION = 0x20,
     AMBAR_HIL_USB_PACKET_VARIABLE_HIL_CONFIG_UPLOAD = 0x21
 } AmbarHilUsbPacketType;
@@ -126,7 +128,9 @@ typedef enum
     AMBAR_HIL_USB_COMMAND_RECOVER_KNOWN_FULL_RETRACT = 0x25,
     AMBAR_HIL_USB_COMMAND_START_LOG = 0x30,
     AMBAR_HIL_USB_COMMAND_STOP_LOG = 0x31,
-    AMBAR_HIL_USB_COMMAND_ERASE_LOG = 0x32
+    AMBAR_HIL_USB_COMMAND_ERASE_LOG = 0x32,
+    AMBAR_HIL_USB_COMMAND_EXPORT_LOG = 0x33,
+    AMBAR_HIL_USB_COMMAND_CANCEL_EXPORT = 0x34
 } AmbarHilUsbCommandCode;
 
 /* Source-compatible vocabulary alias; both names are wire value 0x11. */
@@ -150,6 +154,21 @@ typedef enum
     AMBAR_HIL_USB_ACK_EXECUTION_ERROR = 0x05,
     AMBAR_HIL_USB_ACK_BAD_CRC = 0x06
 } AmbarHilUsbAckCode;
+
+/*
+ * States carried by AMBAR_HIL_USB_PACKET_LOG_STATUS.
+ *
+ * STARTED supplies the full 32-bit record total before archive packets begin.
+ * COMPLETE, CANCELLED, and ERROR terminate the transfer unambiguously.
+ */
+typedef enum
+{
+    AMBAR_HIL_USB_LOG_TRANSFER_STARTED = 0x01,
+    AMBAR_HIL_USB_LOG_TRANSFER_PROGRESS = 0x02,
+    AMBAR_HIL_USB_LOG_TRANSFER_COMPLETE = 0x03,
+    AMBAR_HIL_USB_LOG_TRANSFER_CANCELLED = 0x04,
+    AMBAR_HIL_USB_LOG_TRANSFER_ERROR = 0x05
+} AmbarHilUsbLogTransferState;
 
 typedef enum
 {
@@ -337,6 +356,22 @@ typedef struct
     uint8_t result;
     uint16_t detail;
 } AmbarHilUsbAck;
+
+/*
+ * Fixed 16-byte wire payload for AMBAR_HIL_USB_PACKET_LOG_STATUS.
+ *
+ * This structure is encoded field-by-field by usb_comm.c, so its compiler
+ * padding is never placed on the wire.
+ */
+typedef struct
+{
+    uint16_t command_sequence;
+    uint8_t state;
+    uint8_t error_code;
+    uint32_t total_records;
+    uint32_t records_sent;
+    uint32_t corrupt_records;
+} AmbarHilUsbLogStatus;
 
 typedef struct
 {

@@ -14,6 +14,12 @@
 #include <stddef.h>
 #include <string.h>
 
+#if defined(__GNUC__)
+#define USB_COMM_WEAK __attribute__((weak))
+#else
+#define USB_COMM_WEAK
+#endif
+
 /*
  * Full-Speed USB CDC endpoints use 64-byte packets.
  *
@@ -70,6 +76,20 @@ volatile uint32_t g_usb_comm_tx_errors = 0U;
 /* ------------------------------------------------------------------------- */
 /* Internal helpers                                                          */
 /* ------------------------------------------------------------------------- */
+
+static void USBComm_WriteU16LE(uint8_t *destination, uint16_t value)
+{
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+}
+
+static void USBComm_WriteU32LE(uint8_t *destination, uint32_t value)
+{
+    destination[0] = (uint8_t)value;
+    destination[1] = (uint8_t)(value >> 8);
+    destination[2] = (uint8_t)(value >> 16);
+    destination[3] = (uint8_t)(value >> 24);
+}
 
 static void USBComm_ResetBuffers(void)
 {
@@ -301,6 +321,34 @@ static void USBComm_ServiceTransmit(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* Application command callback                                              */
+/* ------------------------------------------------------------------------- */
+
+USB_COMM_WEAK uint8_t USBComm_ExecuteCommand(
+    uint8_t command,
+    const uint8_t *payload,
+    uint8_t payload_length,
+    uint16_t command_sequence,
+    uint16_t *detail)
+{
+    (void)command;
+    (void)payload;
+    (void)payload_length;
+    (void)command_sequence;
+
+    if (detail != NULL)
+    {
+        *detail = 0U;
+    }
+
+    /*
+     * The safe fallback never reports an application command as successful
+     * unless main.c supplies a strong implementation.
+     */
+    return AMBAR_HIL_USB_ACK_UNSUPPORTED;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Initial command handler                                                   */
 /* ------------------------------------------------------------------------- */
 
@@ -341,13 +389,14 @@ static void USBComm_HandleMessage(
             break;
         }
 
-        /*
-         * Add REQUEST_SNAPSHOT and real flight commands only after
-         * the PING handshake works.
-         */
         default:
         {
-            ack.result = AMBAR_HIL_USB_ACK_UNSUPPORTED;
+            ack.result = USBComm_ExecuteCommand(
+                message->body.command.command,
+                message->body.command.payload,
+                message->body.command.payload_length,
+                message->sequence,
+                &ack.detail);
             break;
         }
     }
@@ -482,6 +531,30 @@ bool USBComm_SendActuatorStatus(
     return AmbarHilUsb_SendActuatorStatus(
         &g_ambar_usb,
         status);
+}
+
+bool USBComm_SendLogStatus(
+    const AmbarHilUsbLogStatus *status)
+{
+    uint8_t payload[AMBAR_HIL_USB_LOG_STATUS_PAYLOAD_SIZE];
+
+    if (!g_ambar_usb_initialized || (status == NULL))
+    {
+        return false;
+    }
+
+    USBComm_WriteU16LE(payload + 0U, status->command_sequence);
+    payload[2] = status->state;
+    payload[3] = status->error_code;
+    USBComm_WriteU32LE(payload + 4U, status->total_records);
+    USBComm_WriteU32LE(payload + 8U, status->records_sent);
+    USBComm_WriteU32LE(payload + 12U, status->corrupt_records);
+
+    return AmbarHilUsb_SendPacket(
+        &g_ambar_usb,
+        AMBAR_HIL_USB_PACKET_LOG_STATUS,
+        payload,
+        sizeof(payload));
 }
 
 AmbarHilUsbStats USBComm_GetStats(void)

@@ -36,6 +36,20 @@ void USBComm_Detach(void);
 bool USBComm_IsConnected(void);
 
 /*
+ * Application command callback.
+ *
+ * usb_comm.c validates the AMBAR framing and handles PING locally. main.c
+ * supplies the strong implementation for application-owned commands such as
+ * EXPORT_LOG and CANCEL_EXPORT.
+ */
+uint8_t USBComm_ExecuteCommand(
+    uint8_t command,
+    const uint8_t *payload,
+    uint8_t payload_length,
+    uint16_t command_sequence,
+    uint16_t *detail);
+
+/*
  * Packet transmission wrappers. These queue complete AMBAR packets.
  */
 bool USBComm_SendTelemetry(const AmbarHilUsbTelemetry *telemetry);
@@ -43,6 +57,8 @@ bool USBComm_SendEvent(const AmbarHilUsbEvent *event);
 bool USBComm_SendHeartbeat(const AmbarHilUsbHeartbeat *heartbeat);
 bool USBComm_SendActuatorStatus(
     const AmbarHilUsbActuatorStatus *status);
+bool USBComm_SendLogStatus(
+    const AmbarHilUsbLogStatus *status);
 
 /*
  * Returns AMBAR transport statistics.
