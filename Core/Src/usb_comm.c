@@ -29,6 +29,30 @@
 #define USB_COMM_RX_TRANSFER_SIZE    64U
 #define USB_COMM_RX_RING_SIZE        256U
 #define USB_COMM_TX_STAGE_SIZE       AMBAR_HIL_USB_MAX_FRAME_SIZE
+/*
+ * Additive direct-USB command. This local constant avoids changing any existing
+ * wire value; keep it synchronized with RawImportController.
+ */
+#define USB_COMM_COMMAND_EXPORT_ARCHIVE 0x33U
+
+/*
+ * main.c supplies the strong implementation. The weak fallback keeps this
+ * transport module linkable in configurations that omit flash export.
+ */
+__weak uint8_t USBComm_ApplicationRequestArchiveExport(
+    uint16_t request_sequence,
+    uint16_t *detail)
+{
+    (void)request_sequence;
+
+    if (detail != NULL)
+    {
+        *detail = 0U;
+    }
+
+    return AMBAR_HIL_USB_ACK_UNSUPPORTED;
+}
+
 
 /*
  * USBX CDC class instance supplied by USBD_CDC_ACM_Activate().
@@ -388,6 +412,22 @@ static void USBComm_HandleMessage(
 
             break;
         }
+        case USB_COMM_COMMAND_EXPORT_ARCHIVE:
+                {
+                    if (message->body.command.payload_length != 0U)
+                    {
+                        ack.result = AMBAR_HIL_USB_ACK_BAD_LENGTH;
+                    }
+                    else
+                    {
+                        ack.result =
+                            USBComm_ApplicationRequestArchiveExport(
+                                message->sequence,
+                                &ack.detail);
+                    }
+
+                    break;
+                }
 
         default:
         {

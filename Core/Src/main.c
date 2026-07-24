@@ -214,7 +214,7 @@ static uint32_t g_memory_last_log_ms = 0U;
 static MemoryExportState_t g_memory_export_state = MEMORY_EXPORT_IDLE;
 static uint16_t g_memory_export_command_sequence = 0U;
 static uint8_t g_memory_export_error_code = 0U;
-static bool g_memory_usb_was_connected = false;
+
 static bool g_memory_export_record_loaded = false;
 static uint32_t g_memory_export_index = 0U;
 static uint32_t g_memory_export_total = 0U;
@@ -224,8 +224,10 @@ static uint8_t g_memory_export_packet_type = ROCKET_PKT_TELEMETRY;
 static RocketTelemetryPayload g_memory_export_payload;
 static RocketEventPayload g_memory_export_event;
 
+
 static uint8_t g_memory_export_phase = MEMORY_EXPORT_PHASE_IDLE;
 static uint8_t g_memory_export_result = MEMORY_ARCHIVE_RESULT_OK;
+static uint16_t g_memory_export_request_sequence = 0U;
 
 /* Previous archived state used to create event records at their exact time. */
 static bool g_memory_event_state_valid = false;
@@ -853,9 +855,18 @@ static void Memory_LogTask(
  * packet out of the CSV while RawImportController can still inspect it through
  * packetReceived(). This keeps the CSV limited to actual flash records.
  */
+
+/**
+ * Queue a transfer-control EVENT without the archive marker.
+ *
+ * changed_flags/current_flags carry the 32-bit record count. The state bytes
+ * carry envelope version/result, and detail correlates this boundary to the
+ * EXPORT_ARCHIVE command sequence.
+ */
 static bool Memory_SendArchiveControl(uint8_t message_code,
                                       uint32_t record_count,
-                                      uint8_t result_code)
+                                      uint8_t result_code,
+                                      uint16_t request_sequence)
 {
     AmbarHilUsbEvent control;
 
@@ -873,53 +884,82 @@ static bool Memory_SendArchiveControl(uint8_t message_code,
     control.message_code = message_code;
 
     /*
-     * Keep the archive marker clear. The packet is transfer metadata, not a
-     * stored flight event, and therefore must not become a CSV row.
+     * Keep detail bit 15 clear because AmbarUsbClient uses that bit to identify
+     * archived EVENT records. The low 15 bits still correlate the boundary to
+     * the request that caused it.
      */
-    control.detail = 0U;
+    control.detail = (uint16_t)(request_sequence & 0x7FFFU);
 
     return USBComm_SendEvent(&control);
 }
 
 /**
- * Replay telemetry and event records only after an EXPORT_LOG USB command.
+ * Strong application callback invoked by usb_comm.c for command 0x33.
  *
- * Telemetry uses reserved bit 7 plus a 10 ms delta, as before. Archived events
- * use detail bit 15 plus a 10 ms delta. The generated flash events currently
- * store detail=0, so no event information is lost by this USB convention.
+ * Exporting only reads flash. It does not alter W25Q64 log metadata and can be
+ * requested repeatedly without unplugging USB.
  */
+uint8_t USBComm_ApplicationRequestArchiveExport(
+    uint16_t request_sequence,
+    uint16_t *detail)
+{
+    if (detail == NULL)
+    {
+        return AMBAR_HIL_USB_ACK_EXECUTION_ERROR;
+    }
+
+    *detail = 0U;
+
+    if (g_memory_export_active)
+    {
+        *detail = (uint16_t)(
+            (g_memory_export_index > 0xFFFFUL)
+                ? 0xFFFFU
+                : g_memory_export_index);
+        return AMBAR_HIL_USB_ACK_BUSY;
+    }
+
+    if (g_memory_flash_init_result != W25Q64_OK)
+    {
+        *detail = (uint16_t)g_memory_flash_init_result;
+        return AMBAR_HIL_USB_ACK_EXECUTION_ERROR;
+    }
+
+    g_memory_export_index = 0U;
+    g_memory_export_total = W25Q64_LogGetCount();
+    g_memory_export_previous_time_ms = 0U;
+    g_memory_exported_records = 0U;
+    g_memory_export_read_failures = 0U;
+    g_memory_export_record_loaded = false;
+    g_memory_export_result = MEMORY_ARCHIVE_RESULT_OK;
+    g_memory_export_request_sequence = request_sequence;
+    g_memory_export_phase = MEMORY_EXPORT_PHASE_BEGIN;
+    g_memory_export_active = true;
+
+    /*
+     * ACK detail is only 16 bits, so it is a preview. BEGIN carries the complete
+     * 32-bit total and is the authoritative value.
+     */
+    *detail = (uint16_t)(
+        (g_memory_export_total > 0xFFFFUL)
+            ? 0xFFFFU
+            : g_memory_export_total);
+
+    return AMBAR_HIL_USB_ACK_OK;
+}
 
 static void Memory_ExportTask(void)
 {
-    const bool connected = USBComm_IsConnected();
-
-    if (!connected)
+    if (!USBComm_IsConnected())
     {
-        g_memory_usb_was_connected = false;
+        /*
+         * A real USB deconfiguration aborts the active request. Merely closing
+         * and reopening the host serial port no longer starts or restarts data.
+         */
         g_memory_export_active = false;
         g_memory_export_record_loaded = false;
         g_memory_export_phase = MEMORY_EXPORT_PHASE_IDLE;
-        g_memory_export_result = MEMORY_ARCHIVE_RESULT_OK;
         return;
-    }
-
-    if (!g_memory_usb_was_connected)
-    {
-        g_memory_usb_was_connected = true;
-        g_memory_export_index = 0U;
-        g_memory_export_total =
-            (g_memory_flash_init_result == W25Q64_OK)
-                ? W25Q64_LogGetCount()
-                : 0U;
-        g_memory_export_previous_time_ms = 0U;
-        g_memory_exported_records = 0U;
-        g_memory_export_record_loaded = false;
-        g_memory_export_result =
-            (g_memory_flash_init_result == W25Q64_OK)
-                ? MEMORY_ARCHIVE_RESULT_OK
-                : MEMORY_ARCHIVE_RESULT_FLASH_ERROR;
-        g_memory_export_phase = MEMORY_EXPORT_PHASE_BEGIN;
-        g_memory_export_active = true;
     }
 
     if (!g_memory_export_active)
@@ -928,20 +968,21 @@ static void Memory_ExportTask(void)
     }
 
     /*
-     * Send the total record count before the first archived row. Queue pressure
-     * is handled by retrying this phase on the next cooperative-loop iteration.
+     * usb_comm.c queues the command ACK before this function can run, so BEGIN
+     * enters the normal TX FIFO directly after that ACK.
      */
     if (g_memory_export_phase == MEMORY_EXPORT_PHASE_BEGIN)
     {
-        if (Memory_SendArchiveControl(MEMORY_ARCHIVE_CONTROL_BEGIN,
-                                      g_memory_export_total,
-                                      g_memory_export_result))
+        if (Memory_SendArchiveControl(
+                MEMORY_ARCHIVE_CONTROL_BEGIN,
+                g_memory_export_total,
+                g_memory_export_result,
+                g_memory_export_request_sequence))
         {
             g_memory_export_phase =
-                ((g_memory_export_result == MEMORY_ARCHIVE_RESULT_OK) &&
-                 (g_memory_export_total != 0U))
-                    ? MEMORY_EXPORT_PHASE_RECORDS
-                    : MEMORY_EXPORT_PHASE_END;
+                (g_memory_export_total == 0U)
+                    ? MEMORY_EXPORT_PHASE_END
+                    : MEMORY_EXPORT_PHASE_RECORDS;
         }
 
         return;
@@ -1057,15 +1098,13 @@ static void Memory_ExportTask(void)
         return;
     }
 
-    /*
-     * Send an explicit terminal count/result. The GroundStation closes the CSV
-     * and loads the analysis graphs only after receiving this packet.
-     */
     if (g_memory_export_phase == MEMORY_EXPORT_PHASE_END)
     {
-        if (Memory_SendArchiveControl(MEMORY_ARCHIVE_CONTROL_END,
-                                      g_memory_exported_records,
-                                      g_memory_export_result))
+        if (Memory_SendArchiveControl(
+                MEMORY_ARCHIVE_CONTROL_END,
+                g_memory_exported_records,
+                g_memory_export_result,
+                g_memory_export_request_sequence))
         {
             g_memory_export_phase = MEMORY_EXPORT_PHASE_IDLE;
             g_memory_export_active = false;
