@@ -772,6 +772,11 @@ static void Memory_LogTask(
         return;
     }
 
+    if (g_request_memory_log_erase)
+    {
+        return;
+    }
+
     {
         const bool deployment_boundary_changed =
             g_memory_event_state_valid &&
@@ -1117,18 +1122,44 @@ static void Memory_ExportTask(void)
 static void Memory_ServiceEraseRequest(void)
 {
     if (!g_request_memory_log_erase ||
-        g_measurement_updates_enabled ||
-        g_memory_export_active ||
         (g_memory_flash_init_result != W25Q64_OK))
     {
         return;
     }
 
+    /*
+     * Clear the request before entering the blocking erase so another part
+     * of the program does not interpret it as an unprocessed request.
+     */
     g_request_memory_log_erase = false;
-    g_memory_log_result = W25Q64_LogErase(&g_memory_flash);
-    g_memory_log_records = W25Q64_LogGetCount();
-    g_memory_log_capacity = W25Q64_LogGetCapacity();
-    g_memory_log_corrupt_records = W25Q64_LogGetCorruptCount();
+
+    /*
+     * Stop any archive export state before modifying flash.
+     */
+    g_memory_export_active = false;
+    g_memory_export_record_loaded = false;
+    g_memory_export_index = 0U;
+    g_memory_export_total = 0U;
+
+    /*
+     * This is blocking. Sensor, radio, and actuator servicing pause while
+     * all log sectors are erased.
+     */
+    g_memory_log_result =
+        W25Q64_LogErase(&g_memory_flash);
+
+    g_memory_log_records =
+        W25Q64_LogGetCount();
+
+    g_memory_log_capacity =
+        W25Q64_LogGetCapacity();
+
+    g_memory_log_corrupt_records =
+        W25Q64_LogGetCorruptCount();
+
+    /*
+     * Force the next valid logger update to establish a fresh event baseline.
+     */
     g_memory_event_state_valid = false;
     g_memory_last_log_ms = HAL_GetTick();
 }
@@ -1725,6 +1756,46 @@ uint8_t RadioBridge_ExecuteCommand(uint8_t command,
                     (airbrake.faults == AIRBRAKE_FAULT_NONE))
                 ? ROCKET_ACK_OK
                 : ROCKET_ACK_EXECUTION_ERROR;
+        }
+
+        case ROCKET_CMD_CLEAR_MEMORY:
+        {
+            if (g_memory_flash_init_result != W25Q64_OK)
+            {
+                *detail = (uint32_t)g_memory_flash_init_result;
+                return ROCKET_ACK_EXECUTION_ERROR;
+            }
+
+            /*
+             * Do not start two erases simultaneously.
+             */
+            if (g_request_memory_log_erase)
+            {
+                *detail = g_memory_log_records;
+                return ROCKET_ACK_BUSY;
+            }
+
+            /*
+             * Reading and erasing the same flash simultaneously is invalid.
+             * Stop any current USB archive export before erasing.
+             */
+            g_memory_export_active = false;
+            g_memory_export_record_loaded = false;
+
+            /*
+             * Accept the command regardless of whether live logging or normal
+             * flight-computer measurements are active.
+             *
+             * The ACK is transmitted before the main loop performs the blocking erase.
+             */
+            g_request_memory_log_erase = true;
+
+            /*
+             * Report how many records existed when the erase was requested.
+             */
+            *detail = g_memory_log_records;
+
+            return ROCKET_ACK_OK;
         }
 
         default:
